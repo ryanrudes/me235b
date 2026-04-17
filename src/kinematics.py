@@ -113,6 +113,21 @@ class UR10e:
             T_B6 = T_B6 @ dh_classical(self.a[i], self.alpha[i], self.d[i], q[i])
         return T_B6 @ self.T6t if include_tool else T_B6
 
+    def fk_to_frame(self, q, n: int) -> np.ndarray:
+        """Forward kinematics through the first ``n`` joints (0 <= n <= 6).
+
+        ``n=5`` gives the pose of frame 5 (the frame **prior** to the flange) in base
+        coordinates. The Lab 3 camera is rigidly attached to frame 5 via ``T5c``, so
+        the live camera pose is ``fk_to_frame(q, 5) @ T5c``.
+        """
+        if not 0 <= n <= 6:
+            raise ValueError(f"fk_to_frame: n must be in [0, 6]; got {n}.")
+        q = as_6vec(q)
+        T = np.eye(4, dtype=float)
+        for i in range(n):
+            T = T @ dh_classical(self.a[i], self.alpha[i], self.d[i], q[i])
+        return T
+
     def safety_check(self, q) -> bool:
         """Return True iff no frame origin (or the tool point) drops below z=0."""
         q = as_6vec(q)

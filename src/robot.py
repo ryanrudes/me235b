@@ -168,12 +168,18 @@ class RobotController:
             print("[robot] gripper_open (no-op; simulate/dry_run)")
         self.renderer.on_gripper("open")
 
-    def gripper_close(self) -> None:
+    def gripper_close(self, *, grasped_width_m: float | None = None) -> None:
+        """Close the gripper.
+
+        ``grasped_width_m`` (optional) is forwarded to the attached renderer so
+        adaptive grippers can stop their fingers at the block's width instead
+        of mashing them fully together. It's ignored for live hardware control.
+        """
         if self.is_live:
             self.robot.gripper.close()
         elif self.verbose:
             print("[robot] gripper_close (no-op; simulate/dry_run)")
-        self.renderer.on_gripper("closed")
+        self.renderer.on_gripper("closed", grasped_width_m=grasped_width_m)
 
     def move_to_pose(
         self,

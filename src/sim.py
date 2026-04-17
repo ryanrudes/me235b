@@ -20,6 +20,8 @@ CLI) importable without them.
 from __future__ import annotations
 
 import builtins
+import os
+import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -34,6 +36,128 @@ from .transforms import R_to_wxyz
 # rotation about the shoulder pan. Adding this offset on every update_cfg lines up my
 # FK with the URDF to ~1e-11 m at joint, wrist, and tool frames.
 UR10E_JOINT_OFFSET: np.ndarray = np.array([np.pi, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
+
+
+# --- Synthetic Robotiq 2F-140 URDF -------------------------------------------
+#
+# ``robot_descriptions`` only ships the 2F-85, but the Lab 3 setup almost
+# certainly uses the 2F-140 (the 2F-85 physically can't fit the lab's 10 or
+# 12 cm blocks). Rather than vendor external mesh assets we describe the
+# 2F-140 with primitive cuboids that match its real external dimensions:
+#
+#   - overall length when closed: ~180 mm from the mounting face
+#   - max finger separation: 140 mm (70 mm stroke per finger)
+#   - body width: 85 mm, thickness: 60 mm
+#
+# The fingers are modelled as simple prismatic joints with a mimic on the
+# opposite side. The real 2F-140 is a 5-bar adaptive linkage, so the fingertip
+# doesn't travel purely laterally - but for visualization this is close
+# enough and it has the right footprint, reach, and stroke.
+ROBOTIQ_2F140_URDF_XML: str = """<?xml version="1.0"?>
+<robot name="robotiq_2f_140_synthetic">
+  <material name="body_dark"><color rgba="0.14 0.14 0.17 1.0"/></material>
+  <material name="body_mid"><color rgba="0.25 0.25 0.27 1.0"/></material>
+  <material name="finger_silver"><color rgba="0.76 0.76 0.78 1.0"/></material>
+  <material name="pad_black"><color rgba="0.08 0.08 0.08 1.0"/></material>
+
+  <!-- Mounting plate (what bolts to the UR flange) -->
+  <link name="robotiq_140_base_link">
+    <visual>
+      <geometry><box size="0.075 0.060 0.050"/></geometry>
+      <origin xyz="0 0 0.025" rpy="0 0 0"/>
+      <material name="body_dark"/>
+    </visual>
+  </link>
+
+  <!-- Main gripper body housing the motor and linkage -->
+  <link name="robotiq_140_body">
+    <visual>
+      <geometry><box size="0.085 0.060 0.070"/></geometry>
+      <origin xyz="0 0 0.035" rpy="0 0 0"/>
+      <material name="body_mid"/>
+    </visual>
+  </link>
+  <joint name="base_to_body" type="fixed">
+    <parent link="robotiq_140_base_link"/>
+    <child link="robotiq_140_body"/>
+    <origin xyz="0 0 0.050" rpy="0 0 0"/>
+  </joint>
+
+  <!-- LEFT finger: prismatic along -y, stroke 0 (closed) .. 0.070 (open, 70 mm per side) -->
+  <link name="left_finger">
+    <visual>
+      <geometry><box size="0.015 0.024 0.055"/></geometry>
+      <origin xyz="0 -0.012 0.0275" rpy="0 0 0"/>
+      <material name="finger_silver"/>
+    </visual>
+    <visual>
+      <geometry><box size="0.028 0.008 0.040"/></geometry>
+      <origin xyz="0 -0.004 0.075" rpy="0 0 0"/>
+      <material name="pad_black"/>
+    </visual>
+  </link>
+  <joint name="finger_joint" type="prismatic">
+    <parent link="robotiq_140_body"/>
+    <child link="left_finger"/>
+    <origin xyz="0 0 0.070" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0.000" upper="0.070" effort="100" velocity="0.1"/>
+  </joint>
+
+  <!-- RIGHT finger mirrors the left via a mimic joint -->
+  <link name="right_finger">
+    <visual>
+      <geometry><box size="0.015 0.024 0.055"/></geometry>
+      <origin xyz="0 0.012 0.0275" rpy="0 0 0"/>
+      <material name="finger_silver"/>
+    </visual>
+    <visual>
+      <geometry><box size="0.028 0.008 0.040"/></geometry>
+      <origin xyz="0 0.004 0.075" rpy="0 0 0"/>
+      <material name="pad_black"/>
+    </visual>
+  </link>
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="robotiq_140_body"/>
+    <child link="right_finger"/>
+    <origin xyz="0 0 0.070" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.000" upper="0.070" effort="100" velocity="0.1"/>
+    <mimic joint="finger_joint" multiplier="1" offset="0"/>
+  </joint>
+</robot>
+"""
+
+
+class GripperSpec:
+    """How a particular gripper URDF maps ``open`` / ``closed`` / block width to its joint value."""
+
+    __slots__ = ("max_stroke_m", "open_value", "closed_value")
+
+    def __init__(self, *, max_stroke_m: float, open_value: float, closed_value: float) -> None:
+        self.max_stroke_m = float(max_stroke_m)
+        self.open_value = float(open_value)
+        self.closed_value = float(closed_value)
+
+    def value_for_width(self, width_m: float | None) -> float:
+        """Interpolate the joint value that leaves just enough room for ``width_m``.
+
+        ``width_m=None`` or any width greater than ``max_stroke_m`` yields the
+        fully-open value (so unreachable blocks at least render sensibly).
+        """
+        if width_m is None:
+            return self.closed_value
+        frac = float(width_m) / self.max_stroke_m
+        frac = max(0.0, min(1.0, frac))
+        return self.closed_value + frac * (self.open_value - self.closed_value)
+
+
+GRIPPER_SPECS: dict[str, GripperSpec] = {
+    # robot_descriptions 2F-85: finger_joint 0 = fully open (~94 mm), 0.725 = closed (~17 mm).
+    "robotiq_2f85": GripperSpec(max_stroke_m=0.085, open_value=0.0, closed_value=0.725),
+    # Our synthetic 2F-140: finger_joint 0 = fully closed (tips touching), 0.070 = fully open (140 mm).
+    "robotiq_2f140": GripperSpec(max_stroke_m=0.140, open_value=0.070, closed_value=0.0),
+}
 
 
 @contextmanager
@@ -68,8 +192,13 @@ class SimulationRenderer:
     def on_joint_step(self, q_class: np.ndarray, *, duration: float = 0.4) -> None:
         """Called whenever the controller commits to a new joint target."""
 
-    def on_gripper(self, state: str) -> None:
-        """``state`` is ``"open"`` or ``"closed"``."""
+    def on_gripper(self, state: str, *, grasped_width_m: float | None = None) -> None:
+        """``state`` is ``"open"`` or ``"closed"``.
+
+        ``grasped_width_m`` (optional) is the width of the block being grabbed; if
+        provided, an adaptive gripper can stop its fingers at the block's size
+        instead of mashing them fully together.
+        """
 
     def add_box(
         self,
@@ -124,7 +253,7 @@ class ViserRenderer(SimulationRenderer):
         camera_look_at: tuple[float, float, float] = (0.3, 0.0, 0.1),
         show_tool_target_frame: bool = True,
         show_gripper: bool = True,
-        gripper_width: float = 0.05,
+        gripper_type: str = "robotiq_2f140",
     ) -> None:
         try:
             import viser
@@ -201,19 +330,44 @@ class ViserRenderer(SimulationRenderer):
             )
             self._update_target_frame(self._current_q)
 
-        # Gripper mesh: a dark cuboid that spans from the flange (frame 6) to the tool
-        # tip. Length comes from ||T6t translation||. We update its pose every joint
-        # step so it rigidly follows the flange.
+        # Gripper: mount a 2F-140 (or any dependency-compatible URDF) onto the
+        # flange. Falls back to a simple cuboid if the gripper URDF can't be
+        # loaded (e.g. viser/yourdfpy/robot_descriptions unavailable).
+        self._gripper_mount_frame: Any | None = None
+        self._gripper_urdf: Any | None = None
+        self._gripper_type: str = str(gripper_type)
+        self._gripper_spec: GripperSpec | None = GRIPPER_SPECS.get(self._gripper_type)
         self._gripper_handle: Any | None = None
-        self._gripper_length: float = float(np.linalg.norm(self.kin.T6t[:3, 3]))
-        self._gripper_width: float = float(gripper_width)
-        if show_gripper and self._gripper_length > 1e-6:
-            self._gripper_handle = self.server.scene.add_box(
-                "/gripper",
-                dimensions=(self._gripper_width, self._gripper_width, self._gripper_length),
-                color=(60, 60, 70),
-            )
+        self._gripper_fallback_length: float = float(np.linalg.norm(self.kin.T6t[:3, 3]))
+
+        if show_gripper:
+            if gripper_type:
+                try:
+                    gripper_urdf_obj = _load_gripper_urdf(
+                        gripper_type, load_meshes=load_meshes, loader=load_robot_description
+                    )
+                    self._gripper_mount_frame = self.server.scene.add_frame(
+                        "/gripper_mount", show_axes=False
+                    )
+                    self._gripper_urdf = ViserUrdf(
+                        self.server,
+                        urdf_or_path=gripper_urdf_obj,
+                        load_meshes=load_meshes,
+                        load_collision_meshes=False,
+                        root_node_name="/gripper_mount",
+                    )
+                except Exception as exc:  # pragma: no cover - best effort fallback
+                    print(f"[viser] gripper URDF '{gripper_type}' unavailable ({exc}); falling back to cuboid.")
+
+            if self._gripper_urdf is None and self._gripper_fallback_length > 1e-6:
+                self._gripper_handle = self.server.scene.add_box(
+                    "/gripper",
+                    dimensions=(0.05, 0.05, self._gripper_fallback_length),
+                    color=(60, 60, 70),
+                )
+
             self._update_gripper_pose(self._current_q)
+            self.on_gripper("open")
 
         with self.server.gui.add_folder("Simulation"):
             self._gui_step_label = self.server.gui.add_text("Last step", "idle", disabled=True)
@@ -231,15 +385,20 @@ class ViserRenderer(SimulationRenderer):
         self._target_frame.position = tuple(float(v) for v in T[:3, 3])
 
     def _update_gripper_pose(self, q: np.ndarray) -> None:
-        if self._gripper_handle is None:
-            return
-        # Flange pose (T_B6) in base. The gripper cuboid is centered halfway between
-        # the flange and the tool tip, oriented with the flange frame.
         T_b6 = self.kin.fk(q, include_tool=False)
-        T_center = T_b6.copy()
-        T_center[:3, 3] = T_b6[:3, 3] + (self._gripper_length / 2.0) * T_b6[:3, 2]
-        self._gripper_handle.wxyz = tuple(float(v) for v in R_to_wxyz(T_center[:3, :3]))
-        self._gripper_handle.position = tuple(float(v) for v in T_center[:3, 3])
+
+        if self._gripper_mount_frame is not None:
+            # Robotiq URDF: move its parent mount frame so all meshes follow.
+            self._gripper_mount_frame.wxyz = tuple(float(v) for v in R_to_wxyz(T_b6[:3, :3]))
+            self._gripper_mount_frame.position = tuple(float(v) for v in T_b6[:3, 3])
+            return
+
+        if self._gripper_handle is not None:
+            # Cuboid fallback: centered halfway between the flange and the tool tip.
+            T_center = T_b6.copy()
+            T_center[:3, 3] = T_b6[:3, 3] + (self._gripper_fallback_length / 2.0) * T_b6[:3, 2]
+            self._gripper_handle.wxyz = tuple(float(v) for v in R_to_wxyz(T_center[:3, :3]))
+            self._gripper_handle.position = tuple(float(v) for v in T_center[:3, 3])
 
     def on_joint_step(self, q_class: np.ndarray, *, duration: float = 0.4) -> None:
         q_target = np.asarray(q_class, dtype=float).reshape(6)
@@ -259,8 +418,21 @@ class ViserRenderer(SimulationRenderer):
         self._current_q = q_target.copy()
         self._gui_step_label.value = np.array2string(q_target, precision=3)
 
-    def on_gripper(self, state: str) -> None:
-        self._gui_gripper_label.value = state
+    def on_gripper(self, state: str, *, grasped_width_m: float | None = None) -> None:
+        if hasattr(self, "_gui_gripper_label"):
+            if state == "closed" and grasped_width_m is not None:
+                self._gui_gripper_label.value = f"closed ({grasped_width_m * 1000:.0f} mm)"
+            else:
+                self._gui_gripper_label.value = state
+
+        if self._gripper_urdf is None or self._gripper_spec is None:
+            return
+
+        if state == "open":
+            value = self._gripper_spec.open_value
+        else:
+            value = self._gripper_spec.value_for_width(grasped_width_m)
+        self._gripper_urdf.update_cfg(np.array([value], dtype=float))
 
     def add_box(
         self,
@@ -352,3 +524,36 @@ def _wxyz_to_R(wxyz: np.ndarray) -> np.ndarray:
         ],
         dtype=float,
     )
+
+
+def _load_gripper_urdf(gripper_type: str, *, load_meshes: bool, loader: Any) -> Any:
+    """Load a gripper URDF by short name.
+
+    ``gripper_type="robotiq_2f140"`` returns the synthetic prismatic-finger URDF
+    (140 mm stroke, ~180 mm reach, no external mesh dependencies). Any other name
+    is forwarded to ``robot_descriptions.loaders.yourdfpy.load_robot_description``
+    as ``f"{gripper_type}_description"``.
+    """
+    import yourdfpy
+
+    if gripper_type == "robotiq_2f140":
+        # yourdfpy reads from a file path, so write the embedded XML to a temp file.
+        fd, path = tempfile.mkstemp(prefix="robotiq_2f140_", suffix=".urdf")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(ROBOTIQ_2F140_URDF_XML)
+            return yourdfpy.URDF.load(path, load_meshes=False, build_scene_graph=True)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    with _utf8_open():
+        return loader(
+            f"{gripper_type}_description",
+            load_meshes=load_meshes,
+            build_scene_graph=load_meshes,
+            load_collision_meshes=False,
+            build_collision_scene_graph=False,
+        )
