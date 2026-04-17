@@ -1,0 +1,12 @@
+---
+description: ME 235B stack, layout, and workflow for agents
+alwaysApply: true
+---
+
+# ME 235B project context
+
+- **Stack**: Python 3.14+, `uv` for env/deps, `pytest` for tests, OpenCV + NumPy + Rich + Typer in `src/` (installed as `me235b`).
+- **Package**: Import path `me235b`; console script **`detect`** (see `pyproject.toml` `[project.scripts]`).
+- **Commands**: `uv sync --all-groups`, then `uv run pytest`. Prefer `uv run …` so tools use the project environment.
+- **Changes**: Keep diffs minimal; preserve existing formatting and public APIs unless the task requires a break.
+- **Calibration**: `src/detector.py` embeds camera intrinsics; treat as lab-provided data unless the brief says to replace them.

@@ -1,10 +1,10 @@
 ---
-description: Python style and typing expectations for lab1 sources
-globs: lab1/**/*.py
+description: Python style and typing expectations for me235b sources
+globs: src/**/*.py
 alwaysApply: false
 ---
 
-# Python conventions (`lab1/`)
+# Python conventions (`src/`)
 
 - Use **type hints** on public functions and methods; prefer `from typing_extensions import Annotated` where the file already does for Typer.
 - Prefer **small, focused functions**; avoid duplicating OpenCV detector setup—reuse or extend existing helpers on `ArucoDetector`.

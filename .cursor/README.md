@@ -1,6 +1,6 @@
 # Cursor agent configuration (this repo)
 
-This folder is safe to commit: it contains **no secrets**, only prompts and rules for AI-assisted work on ME 235B Lab 1.
+This folder is safe to commit: it contains **no secrets**, only prompts and rules for AI-assisted work on the **me235b** project (ME 235B).
 
 ## Contents
 

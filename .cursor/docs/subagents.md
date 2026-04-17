@@ -7,7 +7,7 @@ This project is small, but these habits keep automated work reliable.
 Use a **readonly** subagent or narrow search when you need to:
 
 - Map where a symbol is defined or used across the tree.
-- Compare patterns (`lab1/` vs `tests/`) before editing.
+- Compare patterns (`src/` vs `tests/`) before editing.
 - Answer “how does X work?” without changing files.
 
 Avoid write access until the goal and files to touch are clear.

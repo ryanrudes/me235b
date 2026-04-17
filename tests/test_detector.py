@@ -1,4 +1,4 @@
-from lab1.detector import ArucoDetector
+from me235b.detector import ArucoDetector
 
 from math import pi
 

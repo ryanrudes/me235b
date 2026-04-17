@@ -1,6 +1,6 @@
-# Agent guide (ME 235B Lab 1)
+# Agent guide (ME 235B — me235b)
 
-This repository is a small Python package named **lab1** (ArUco-style detection using OpenCV, NumPy, Rich, Typer). Python **3.14+** is required (`requires-python` in `pyproject.toml`).
+This repository is a small Python package named **me235b** (ArUco-style detection using OpenCV, NumPy, Rich, Typer). Python **3.14+** is required (`requires-python` in `pyproject.toml`).
 
 ## Quick commands
 
@@ -16,7 +16,7 @@ The package exposes the `detect` script via `[project.scripts]` in `pyproject.to
 
 ## Layout
 
-- `lab1/` — library and CLI (`cli.py`, `detector.py`, …)
+- `src/` — library and CLI (`cli.py`, `detector.py`, …); installed as the **`me235b`** package
 - `tests/` — pytest tests
 - `assets/` — optional images or fixtures for local experiments
 - `main.py` — thin entry if used for class scaffolding

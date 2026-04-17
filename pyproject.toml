@@ -1,5 +1,5 @@
 [project]
-name = "lab1"
+name = "me235b"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -24,6 +24,7 @@ dev = [
 [tool.uv]
 package = true
 [tool.setuptools]
-packages = ["lab1"]
+package-dir = { "me235b" = "src" }
+packages = ["me235b"]
 [project.scripts]
-detect = "lab1.cli:app"
+detect = "me235b.cli:app"
