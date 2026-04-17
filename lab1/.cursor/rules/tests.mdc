@@ -1,0 +1,12 @@
+---
+description: Pytest expectations and test layout for this repo
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Tests (`tests/`)
+
+- Framework: **pytest** (`uv run pytest` from repo root).
+- Prefer **fast, deterministic** tests: mock or synthesize image data when real camera frames are not required.
+- When behavior changes, update tests **in the same change**; do not leave failing assertions silently “for later”.
+- If OpenCV is required in a test, keep arrays small (e.g. tiny synthetic frames) to keep CI/local runs quick.

@@ -1,0 +1,53 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build outputs
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# uv (local cache if present in project)
+.uv/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local env files (secrets); keep examples tracked with !.env.example
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+# Track shared VS Code tasks/recommendations; ignore other local workspace files
+.vscode/*
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# Writeup
+writeup.md

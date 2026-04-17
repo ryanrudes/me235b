@@ -1,0 +1,8 @@
+# Reduce noise for Cursor indexing (does not affect git)
+.venv/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+*.egg-info/

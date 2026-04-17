@@ -1,0 +1,25 @@
+[project]
+name = "lab1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "rich>=15.0.0",
+    "typer>=0.24.1",
+    "typing-extensions>=4.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+[tool.uv]
+package = true
+[tool.setuptools]
+packages = ["lab1"]
+[project.scripts]
+detect = "lab1.cli:app"
