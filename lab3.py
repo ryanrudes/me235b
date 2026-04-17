@@ -1,4 +1,4 @@
-from . import lab2
+import .lab2
 
 import numpy as np
 import urx
@@ -253,7 +253,7 @@ def perform_scan(
     camera: cv2.VideoCapture,
     detector: ArucoDetector,
     scan_height: float = 0.4,
-) -> tuple[dict[BoxTag, np.ndarray], dict[PadTag, np.ndarray]]:
+) -> dict[HanoiTag, np.ndarray]:
     # Box bounds in base frame
     # box_bounds = np.array([[-0.7, -1.0, -0.03], [0.7, 0.0, 0.03]])
 

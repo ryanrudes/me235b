@@ -20,6 +20,7 @@ dev = [
     "viser>=1.0.18",
     "robot_descriptions",
     "pyliblzfse",
+    "xacrodoc>=2.0.0",
 ]
 [tool.uv]
 package = true

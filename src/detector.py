@@ -21,14 +21,18 @@ class ArucoDetector:
 
     marker_length = 0.02  # meters
 
-    def find_tags(self, frame: np.ndarray) -> list[tuple[int, np.ndarray]]:
-        """
-        Find ArUco tags in the given frame.
+    def find_tags(self, frame: np.ndarray) -> list[tuple[int, np.ndarray, np.ndarray]]:
+        """Detect ArUco tags in ``frame`` and return ``[(id, rvec, tvec), ...]``.
+
+        Returns an empty list if no tags are detected.
         """
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
         parameters = cv2.aruco.DetectorParameters()
         detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-        corners, ids, rejected = detector.detectMarkers(frame)
+        corners, ids, _rejected = detector.detectMarkers(frame)
+
+        if ids is None or len(ids) == 0:
+            return []
 
         object_points = np.array([
             [-self.marker_length / 2, +self.marker_length / 2, 0],
@@ -37,12 +41,11 @@ class ArucoDetector:
             [-self.marker_length / 2, -self.marker_length / 2, 0],
         ])
 
-        detections = []
-
+        detections: list[tuple[int, np.ndarray, np.ndarray]] = []
         for i in range(len(ids)):
-            _, rvec, tvec = cv2.solvePnP(object_points, corners[i],
-                                         self.camera_matrix, self.dist_coeffs)
-
+            _, rvec, tvec = cv2.solvePnP(
+                object_points, corners[i], self.camera_matrix, self.dist_coeffs
+            )
             detections.append((ids[i][0].item(), rvec[:, 0], tvec[:, 0]))
 
         return detections
