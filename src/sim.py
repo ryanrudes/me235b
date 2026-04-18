@@ -23,7 +23,10 @@ import builtins
 import os
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
@@ -38,95 +41,144 @@ from .transforms import R_to_wxyz
 UR10E_JOINT_OFFSET: np.ndarray = np.array([np.pi, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
 
 
-# --- Synthetic Robotiq 2F-140 URDF -------------------------------------------
+# --- ROS-Industrial Robotiq URDF fetcher -------------------------------------
 #
-# ``robot_descriptions`` only ships the 2F-85, but the Lab 3 setup almost
-# certainly uses the 2F-140 (the 2F-85 physically can't fit the lab's 10 or
-# 12 cm blocks). Rather than vendor external mesh assets we describe the
-# 2F-140 with primitive cuboids that match its real external dimensions:
-#
-#   - overall length when closed: ~180 mm from the mounting face
-#   - max finger separation: 140 mm (70 mm stroke per finger)
-#   - body width: 85 mm, thickness: 60 mm
-#
-# The fingers are modelled as simple prismatic joints with a mimic on the
-# opposite side. The real 2F-140 is a 5-bar adaptive linkage, so the fingertip
-# doesn't travel purely laterally - but for visualization this is close
-# enough and it has the right footprint, reach, and stroke.
-ROBOTIQ_2F140_URDF_XML: str = """<?xml version="1.0"?>
-<robot name="robotiq_2f_140_synthetic">
-  <material name="body_dark"><color rgba="0.14 0.14 0.17 1.0"/></material>
-  <material name="body_mid"><color rgba="0.25 0.25 0.27 1.0"/></material>
-  <material name="finger_silver"><color rgba="0.76 0.76 0.78 1.0"/></material>
-  <material name="pad_black"><color rgba="0.08 0.08 0.08 1.0"/></material>
+# ``robot_descriptions`` only ships the 2F-85. The Lab 3 setup uses the 2F-140
+# (larger stroke, longer fingers). We fetch the canonical ROS-Industrial
+# `robotiq_2f_140_gripper_visualization` xacros and meshes from the
+# `ros-industrial-attic/robotiq` repo on first use and cache them under the
+# user's home cache directory. The URDF is produced by running the top-level
+# xacro through ``xacrodoc`` with the cache dir registered as a ROS package,
+# then loaded via ``yourdfpy`` with a filename handler that maps `package://`
+# URIs to our cache layout.
+ROSI_ROBOTIQ_BASE_URL: str = (
+    "https://raw.githubusercontent.com/ros-industrial-attic/robotiq/"
+    "kinetic-devel/robotiq_2f_140_gripper_visualization"
+)
 
-  <!-- Mounting plate (what bolts to the UR flange) -->
-  <link name="robotiq_140_base_link">
-    <visual>
-      <geometry><box size="0.075 0.060 0.050"/></geometry>
-      <origin xyz="0 0 0.025" rpy="0 0 0"/>
-      <material name="body_dark"/>
-    </visual>
-  </link>
+# Files we need pulled from the repo. Kept in a constant so the first-run
+# bootstrap is transparent and easy to audit.
+ROSI_ROBOTIQ_140_FILES: tuple[str, ...] = (
+    "urdf/robotiq_arg2f.xacro",
+    "urdf/robotiq_arg2f_140_model.xacro",
+    "urdf/robotiq_arg2f_140_model_macro.xacro",
+    "urdf/robotiq_arg2f_transmission.xacro",
+    "meshes/visual/robotiq_arg2f_140_inner_finger.stl",
+    "meshes/visual/robotiq_arg2f_140_inner_knuckle.stl",
+    "meshes/visual/robotiq_arg2f_140_outer_finger.stl",
+    "meshes/visual/robotiq_arg2f_140_outer_knuckle.stl",
+    "meshes/visual/robotiq_arg2f_base_link.stl",
+    "meshes/visual/robotiq_arg2f_coupling.stl",
+    "meshes/collision/robotiq_arg2f_140_inner_finger.stl",
+    "meshes/collision/robotiq_arg2f_140_inner_knuckle.stl",
+    "meshes/collision/robotiq_arg2f_140_outer_finger.stl",
+    "meshes/collision/robotiq_arg2f_140_outer_knuckle.stl",
+    "meshes/collision/robotiq_arg2f_base_link.stl",
+    "meshes/collision/robotiq_arg2f_coupling.stl",
+)
 
-  <!-- Main gripper body housing the motor and linkage -->
-  <link name="robotiq_140_body">
-    <visual>
-      <geometry><box size="0.085 0.060 0.070"/></geometry>
-      <origin xyz="0 0 0.035" rpy="0 0 0"/>
-      <material name="body_mid"/>
-    </visual>
-  </link>
-  <joint name="base_to_body" type="fixed">
-    <parent link="robotiq_140_base_link"/>
-    <child link="robotiq_140_body"/>
-    <origin xyz="0 0 0.050" rpy="0 0 0"/>
-  </joint>
 
-  <!-- LEFT finger: prismatic along -y, stroke 0 (closed) .. 0.070 (open, 70 mm per side) -->
-  <link name="left_finger">
-    <visual>
-      <geometry><box size="0.015 0.024 0.055"/></geometry>
-      <origin xyz="0 -0.012 0.0275" rpy="0 0 0"/>
-      <material name="finger_silver"/>
-    </visual>
-    <visual>
-      <geometry><box size="0.028 0.008 0.040"/></geometry>
-      <origin xyz="0 -0.004 0.075" rpy="0 0 0"/>
-      <material name="pad_black"/>
-    </visual>
-  </link>
-  <joint name="finger_joint" type="prismatic">
-    <parent link="robotiq_140_body"/>
-    <child link="left_finger"/>
-    <origin xyz="0 0 0.070" rpy="0 0 0"/>
-    <axis xyz="0 -1 0"/>
-    <limit lower="0.000" upper="0.070" effort="100" velocity="0.1"/>
-  </joint>
+def _me235b_cache_dir() -> Path:
+    """Per-user cache directory for downloaded URDF assets."""
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    root = base / "me235b"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
-  <!-- RIGHT finger mirrors the left via a mimic joint -->
-  <link name="right_finger">
-    <visual>
-      <geometry><box size="0.015 0.024 0.055"/></geometry>
-      <origin xyz="0 0.012 0.0275" rpy="0 0 0"/>
-      <material name="finger_silver"/>
-    </visual>
-    <visual>
-      <geometry><box size="0.028 0.008 0.040"/></geometry>
-      <origin xyz="0 0.004 0.075" rpy="0 0 0"/>
-      <material name="pad_black"/>
-    </visual>
-  </link>
-  <joint name="right_finger_joint" type="prismatic">
-    <parent link="robotiq_140_body"/>
-    <child link="right_finger"/>
-    <origin xyz="0 0 0.070" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="0.000" upper="0.070" effort="100" velocity="0.1"/>
-    <mimic joint="finger_joint" multiplier="1" offset="0"/>
-  </joint>
-</robot>
-"""
+
+def _fetch_rosi_robotiq_140(force: bool = False, verbose: bool = True) -> Path:
+    """Download the ROS-Industrial 2F-140 package into the cache. Returns its package root.
+
+    Idempotent: skips files that already exist with the expected size.
+    """
+    pkg_dir = _me235b_cache_dir() / "robotiq_2f_140_gripper_visualization"
+    for rel in ROSI_ROBOTIQ_140_FILES:
+        dst = pkg_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not force and dst.exists() and dst.stat().st_size > 0:
+            continue
+        url = f"{ROSI_ROBOTIQ_BASE_URL}/{rel}"
+        if verbose:
+            print(f"[sim] downloading {rel}...")
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        try:
+            urllib.request.urlretrieve(url, str(tmp))
+            tmp.replace(dst)
+        except urllib.error.URLError as exc:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"Failed to download {url}: {exc}") from exc
+
+    # A minimal ROS package.xml so xacrodoc / rospkg will locate the package
+    # via ROS_PACKAGE_PATH = cache_dir/.
+    pkg_xml = pkg_dir / "package.xml"
+    if not pkg_xml.exists():
+        pkg_xml.write_text(
+            '<?xml version="1.0"?>\n'
+            '<package format="2">\n'
+            '  <name>robotiq_2f_140_gripper_visualization</name>\n'
+            '  <version>0.0.1</version>\n'
+            '  <description>Cached subset from ros-industrial-attic/robotiq for offline '
+            'rendering.</description>\n'
+            '  <maintainer email="none@example.com">cache</maintainer>\n'
+            '  <license>BSD</license>\n'
+            '</package>\n',
+            encoding="utf-8",
+        )
+    return pkg_dir
+
+
+def _process_rosi_xacro(pkg_dir: Path) -> str:
+    """Run xacrodoc on the top-level 2F-140 xacro and return the resulting URDF XML string."""
+    from xacrodoc import XacroDoc, packages
+
+    top = pkg_dir / "urdf" / "robotiq_arg2f_140_model.xacro"
+
+    # Tell xacrodoc's own package finder (separate from rospkg) where the
+    # downloaded package lives, so `$(find robotiq_2f_140_gripper_visualization)`
+    # resolves to our cache directory.
+    packages.update_package_cache({pkg_dir.name: str(pkg_dir)})
+
+    with _utf8_open():
+        doc = XacroDoc.from_file(str(top), walk_up=False)
+        return doc.to_urdf_string()
+
+
+def _load_rosi_robotiq_140(load_meshes: bool = True) -> Any:
+    """Ensure the assets are cached, process the xacro, load via yourdfpy."""
+    import yourdfpy
+
+    pkg_dir = _fetch_rosi_robotiq_140()
+    urdf_xml = _process_rosi_xacro(pkg_dir)
+
+    # xacrodoc pre-resolves `package://robotiq_2f_140_gripper_visualization/...`
+    # into `file://<absolute path>` before we ever see it. On Windows those look
+    # like `file://C:\Users\...\mesh.stl` with backslashes, which trimesh can't
+    # parse. Strip the scheme so yourdfpy just gets a plain local path.
+    pkg_name = pkg_dir.name
+    package_prefix = f"package://{pkg_name}/"
+
+    def filename_handler(fname: str) -> str:
+        if fname.startswith("file://"):
+            return fname[len("file://"):]
+        if fname.startswith(package_prefix):
+            return str(pkg_dir / fname[len(package_prefix):])
+        return fname
+
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False, encoding="utf-8")
+    try:
+        tmp.write(urdf_xml)
+        tmp.close()
+        return yourdfpy.URDF.load(
+            tmp.name,
+            build_scene_graph=True,
+            load_meshes=load_meshes,
+            build_collision_scene_graph=False,
+            load_collision_meshes=False,
+            filename_handler=filename_handler,
+        )
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 class GripperSpec:
@@ -143,7 +195,7 @@ class GripperSpec:
         """Interpolate the joint value that leaves just enough room for ``width_m``.
 
         ``width_m=None`` or any width greater than ``max_stroke_m`` yields the
-        fully-open value (so unreachable blocks at least render sensibly).
+        fully-closed value (so unreachable blocks at least render sensibly).
         """
         if width_m is None:
             return self.closed_value
@@ -153,10 +205,11 @@ class GripperSpec:
 
 
 GRIPPER_SPECS: dict[str, GripperSpec] = {
-    # robot_descriptions 2F-85: finger_joint 0 = fully open (~94 mm), 0.725 = closed (~17 mm).
+    # robot_descriptions 2F-85 and the ROS-Industrial 2F-140 share the same
+    # revolute-joint convention: finger_joint = 0 is fully open, the upper
+    # limit is fully closed.
     "robotiq_2f85": GripperSpec(max_stroke_m=0.085, open_value=0.0, closed_value=0.725),
-    # Our synthetic 2F-140: finger_joint 0 = fully closed (tips touching), 0.070 = fully open (140 mm).
-    "robotiq_2f140": GripperSpec(max_stroke_m=0.140, open_value=0.070, closed_value=0.0),
+    "robotiq_2f140": GripperSpec(max_stroke_m=0.140, open_value=0.0, closed_value=0.7),
 }
 
 
@@ -208,6 +261,25 @@ class SimulationRenderer:
         label: str = "box",
         color: tuple[int, int, int] = (120, 150, 220),
     ) -> str:
+        return ""
+
+    def add_aruco_tag(
+        self,
+        marker_id: int,
+        T: np.ndarray,
+        size_m: float,
+        *,
+        parent: str = "",
+        dictionary: int | None = None,
+    ) -> str:
+        """Render an ArUco marker as a flat image quad.
+
+        ``T`` is the marker pose; if ``parent`` is a non-empty scene path, the
+        marker is added as a child of that object and ``T`` is interpreted in
+        the parent's local frame (so the tag moves rigidly with the parent).
+        ``dictionary`` is an ``cv2.aruco.DICT_*`` constant; default matches the
+        Lab-3 dictionary.
+        """
         return ""
 
     def set_object_pose(self, handle: str, T: np.ndarray) -> None:
@@ -463,6 +535,39 @@ class ViserRenderer(SimulationRenderer):
         obj.wxyz = tuple(float(q) for q in R_to_wxyz(T[:3, :3]))
         obj.position = tuple(float(v) for v in T[:3, 3])
 
+    def add_aruco_tag(
+        self,
+        marker_id: int,
+        T: np.ndarray,
+        size_m: float,
+        *,
+        parent: str = "",
+        dictionary: int | None = None,
+    ) -> str:
+        try:
+            img = _generate_aruco_image(int(marker_id), dictionary=dictionary)
+        except Exception as exc:  # pragma: no cover - best-effort visual
+            print(f"[viser] ArUco id={marker_id} render skipped ({exc})")
+            return ""
+
+        if parent:
+            name = f"{parent}/aruco"
+        else:
+            self._object_counter += 1
+            name = f"/objects/aruco_{marker_id}_{self._object_counter}"
+
+        T = np.asarray(T, dtype=float)
+        handle = self.server.scene.add_image(
+            name,
+            image=img,
+            render_width=float(size_m),
+            render_height=float(size_m),
+            wxyz=R_to_wxyz(T[:3, :3]),
+            position=tuple(float(v) for v in T[:3, 3]),
+        )
+        self._object_handles[name] = handle
+        return name
+
     def attach_to_end_effector(self, handle: str) -> None:
         if handle not in self._object_handles:
             return
@@ -514,6 +619,39 @@ class ViserRenderer(SimulationRenderer):
                 pass
 
 
+_ARUCO_IMAGE_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _generate_aruco_image(marker_id: int, *, dictionary: int | None = None, size_px: int = 256) -> np.ndarray:
+    """Return an RGB image of the given ArUco marker, cached per (dict, id, size).
+
+    The marker is rendered with a small white quiet-zone border around it (the same
+    white margin printed tags have in practice) so the tag edges are clearly
+    visible against a colored block in the viewer.
+    """
+    import cv2
+
+    if dictionary is None:
+        dictionary = cv2.aruco.DICT_ARUCO_ORIGINAL
+
+    cache_key = (int(dictionary), int(marker_id), int(size_px))
+    cached = _ARUCO_IMAGE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    aruco_dict = cv2.aruco.getPredefinedDictionary(dictionary)
+    marker_size = int(size_px * 5 / 6)  # leave ~1/12 white quiet zone on each side
+    marker = cv2.aruco.generateImageMarker(aruco_dict, int(marker_id), marker_size)
+
+    padded = np.full((size_px, size_px), 255, dtype=np.uint8)
+    pad = (size_px - marker_size) // 2
+    padded[pad : pad + marker_size, pad : pad + marker_size] = marker
+
+    rgb = cv2.cvtColor(padded, cv2.COLOR_GRAY2RGB)
+    _ARUCO_IMAGE_CACHE[cache_key] = rgb
+    return rgb
+
+
 def _wxyz_to_R(wxyz: np.ndarray) -> np.ndarray:
     w, x, y, z = (float(v) for v in np.asarray(wxyz, dtype=float).reshape(4))
     return np.array(
@@ -529,25 +667,15 @@ def _wxyz_to_R(wxyz: np.ndarray) -> np.ndarray:
 def _load_gripper_urdf(gripper_type: str, *, load_meshes: bool, loader: Any) -> Any:
     """Load a gripper URDF by short name.
 
-    ``gripper_type="robotiq_2f140"`` returns the synthetic prismatic-finger URDF
-    (140 mm stroke, ~180 mm reach, no external mesh dependencies). Any other name
-    is forwarded to ``robot_descriptions.loaders.yourdfpy.load_robot_description``
+    ``gripper_type="robotiq_2f140"`` downloads (on first use) and processes the
+    canonical ROS-Industrial 2F-140 xacro from the
+    ``ros-industrial-attic/robotiq`` repo, caches the result under
+    ``~/.cache/me235b/``, and loads it with ``yourdfpy``. Any other name is
+    forwarded to ``robot_descriptions.loaders.yourdfpy.load_robot_description``
     as ``f"{gripper_type}_description"``.
     """
-    import yourdfpy
-
     if gripper_type == "robotiq_2f140":
-        # yourdfpy reads from a file path, so write the embedded XML to a temp file.
-        fd, path = tempfile.mkstemp(prefix="robotiq_2f140_", suffix=".urdf")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(ROBOTIQ_2F140_URDF_XML)
-            return yourdfpy.URDF.load(path, load_meshes=False, build_scene_graph=True)
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        return _load_rosi_robotiq_140(load_meshes=load_meshes)
 
     with _utf8_open():
         return loader(

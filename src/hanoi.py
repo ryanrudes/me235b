@@ -246,8 +246,16 @@ class HanoiTask:
         self._holding: BoxTag | None = None
 
         # Internal world model.
+        # pad_centers: pad ID -> (x, y, z) of the pad's geometric center in base frame.
+        # pad_stacks:  pad ID -> list of blocks on that pad, bottom -> top.
+        # block_centers: block ID -> (x, y, z) of the block's geometric center in base frame.
+        #   After a scan, xy is taken from the ArUco detection (so corner-stacked blocks
+        #   are handled correctly) and z is derived from the block's stack position
+        #   (robust against the ArUco z-noise the PDF warns about).
+        #   After a move, we update this entry to the pad-centered placement pose.
         self.pad_centers: dict[PadTag, np.ndarray] = {}
         self.pad_stacks: dict[PadTag, list[BoxTag]] = {p: [] for p in PadTag}
+        self.block_centers: dict[BoxTag, np.ndarray] = {}
 
     @property
     def renderer(self) -> SimulationRenderer:
@@ -257,9 +265,17 @@ class HanoiTask:
         """Drive the gripper to the configured home pose."""
         return self.controller.home(self.T_home, verify_fk=True)
 
-    def _grab_frame(self) -> np.ndarray | None:
+    def _grab_frame(self, *, flush: int = 3) -> np.ndarray | None:
+        """Read a frame from the camera, flushing a few stale buffered frames first.
+
+        USB webcams often keep a 2-3 frame internal buffer, so the first ``read()``
+        after a robot motion returns an image from before the move finished. We
+        discard ``flush`` frames before returning the one used for detection.
+        """
         if self.camera is None:
             return None
+        for _ in range(max(0, flush)):
+            self.camera.read()
         ok, frame = self.camera.read()
         if not ok:
             raise RuntimeError("HanoiTask.scan: camera.read() failed.")
@@ -320,11 +336,17 @@ class HanoiTask:
         box_detections: dict[BoxTag, np.ndarray],
         pad_detections: dict[PadTag, np.ndarray],
     ) -> None:
-        """Populate :attr:`pad_centers` and :attr:`pad_stacks` from a scan.
+        """Populate pad_centers, pad_stacks, and block_centers from a scan.
 
         Pad center = ArUco corner + (pad_size/2, pad_size/2, 0) in base frame.
-        Each block is assigned to whichever pad center it's closest to (xy), then
-        each pad's blocks are ordered largest-at-bottom (Hanoi invariant).
+        Each block is assigned to whichever pad center it's closest to in xy.
+
+        Per the PDF, blocks in the starting tower are *corner-stacked* (not centered
+        on the pad) so their tags stay visible. We therefore use the ArUco's
+        detected xy for each block's position instead of assuming pad-centered
+        placement. The block's z is derived from its size-sorted stack position
+        (the PDF explicitly warns about ArUco z-estimation noise and suggests
+        falling back to the known block thicknesses).
         """
         self.pad_centers.clear()
         for tag, T_aruco in pad_detections.items():
@@ -335,14 +357,21 @@ class HanoiTask:
             )
 
         self.pad_stacks = {p: [] for p in PadTag}
+        self.block_centers.clear()
+
         if not self.pad_centers:
             return
 
+        # First pass: compute each block's base-frame xy from its ArUco detection
+        # and assign the block to the pad whose center it is xy-closest to.
+        block_xy: dict[BoxTag, np.ndarray] = {}
         for box, T_aruco in box_detections.items():
-            box_pos = np.asarray(T_aruco, dtype=float)[:3, 3]
+            T_block = self.detector.grasp_pose_for(box, T_aruco)
+            block_xy[box] = T_block[:3, 3][:2].copy()
+
             closest_pad = min(
                 self.pad_centers,
-                key=lambda p: float(np.linalg.norm(self.pad_centers[p][:2] - box_pos[:2])),
+                key=lambda p: float(np.linalg.norm(self.pad_centers[p][:2] - block_xy[box])),
             )
             self.pad_stacks[closest_pad].append(box)
 
@@ -350,34 +379,53 @@ class HanoiTask:
         for stack in self.pad_stacks.values():
             stack.sort(key=lambda b: -BOX_WIDTHS[b])
 
-    def _pose_on_stack(self, pad: PadTag, stack_index: int) -> np.ndarray:
-        """Gripper-center pose for grabbing / placing at position ``stack_index`` on ``pad``.
-
-        ``stack_index`` is the 0-based index of the block from the bottom. The gripper
-        center sits at the block's center, so z = (stack_index + 0.5) * block_thickness.
-        """
-        if pad not in self.pad_centers:
-            raise RuntimeError(f"_pose_on_stack: pad {pad.name} has no known center (run scan first).")
-
+        # Second pass: compute full block centers. xy = detected, z = size-sorted
+        # stack position * block_thickness + block_thickness / 2.
         bt = self.detector.block_thickness
-        center_xy = self.pad_centers[pad]
-        z = stack_index * bt + bt / 2
+        for stack in self.pad_stacks.values():
+            for i, box in enumerate(stack):
+                xy = block_xy[box]
+                self.block_centers[box] = np.array(
+                    [float(xy[0]), float(xy[1]), i * bt + bt / 2],
+                    dtype=float,
+                )
 
+    def _pose_from_center(self, center_xyz: np.ndarray) -> np.ndarray:
+        """Build a gripper pose targeting ``center_xyz`` with the clean downward approach."""
         T = np.eye(4, dtype=float)
         T[:3, :3] = GRASP_ORIENTATION
-        T[:3, 3] = [float(center_xy[0]), float(center_xy[1]), float(z)]
+        T[:3, 3] = np.asarray(center_xyz, dtype=float).reshape(3)
         return T
 
     def grasp_pose_for_top(self, pad: PadTag) -> tuple[BoxTag, np.ndarray]:
-        """Return ``(block_on_top, gripper_pose)`` for the current top of ``pad``."""
+        """Return ``(block_on_top, gripper_pose)`` for the current top of ``pad``.
+
+        Uses the block's last-known base-frame center (from the initial scan, updated
+        after each successful place) so corner-stacked starting blocks are still
+        grasped at their true xy.
+        """
         stack = self.pad_stacks.get(pad, [])
         if not stack:
             raise RuntimeError(f"grasp_pose_for_top: pad {pad.name} is empty.")
-        return stack[-1], self._pose_on_stack(pad, len(stack) - 1)
+        top_box = stack[-1]
+        if top_box not in self.block_centers:
+            raise RuntimeError(f"grasp_pose_for_top: no known center for {top_box.name}.")
+        return top_box, self._pose_from_center(self.block_centers[top_box])
 
     def place_pose_for_top(self, pad: PadTag) -> np.ndarray:
-        """Return the gripper pose for landing the next block on ``pad``."""
-        return self._pose_on_stack(pad, len(self.pad_stacks.get(pad, [])))
+        """Return the gripper pose for landing the next block centrally on ``pad``.
+
+        We deliberately center the block on the destination pad (ignoring how the
+        starting stack was corner-offset) because after the first move everything
+        is in our hands and central stacking simplifies IK reachability and
+        subsequent grasps.
+        """
+        if pad not in self.pad_centers:
+            raise RuntimeError(f"place_pose_for_top: pad {pad.name} has no known center (run scan first).")
+        bt = self.detector.block_thickness
+        center_xy = self.pad_centers[pad]
+        z = len(self.pad_stacks.get(pad, [])) * bt + bt / 2
+        return self._pose_from_center([float(center_xy[0]), float(center_xy[1]), float(z)])
 
     def _hover_pose(self, target: np.ndarray) -> np.ndarray:
         """Return ``target`` shifted up by :attr:`approach_height` in the base z axis."""
@@ -386,10 +434,13 @@ class HanoiTask:
         return out
 
     def pick_up(self, tag: BoxTag, grasp_pose: np.ndarray) -> bool:
-        """Hover -> descend -> close -> lift sequence for ``tag`` at ``grasp_pose``.
+        """Open -> hover -> descend -> close -> lift sequence for ``tag`` at ``grasp_pose``.
 
+        Opens the gripper first so a previously-closed gripper doesn't slam its
+        fingers into the target block on descent.
         Returns ``True`` if every motion step's IK succeeded.
         """
+        self.controller.gripper_open()
         hover = self._hover_pose(grasp_pose)
 
         for label, T in (("hover-above", hover), ("descend", grasp_pose)):
@@ -431,14 +482,19 @@ class HanoiTask:
         return ok
 
     def populate_scene(self) -> None:
-        """Render every known pad and every block (at its *current* stacked pose).
+        """Render every known pad and every block at its detected position.
 
-        Uses the internal :attr:`pad_stacks` model, so whatever state the scan
-        produced is what the viewer shows. Stacks are drawn centered on the pad.
+        Uses :attr:`block_centers` so corner-stacked starting blocks are drawn
+        at their true xy, matching where the real gripper will grasp. Each
+        object's ArUco tag is added as a child of its host scene node (so it
+        moves rigidly with a grasped block) and positioned in the bottom-left
+        corner of the host's top face, per the PDF convention.
         """
         self._box_handles.clear()
         self._pad_handles.clear()
 
+        tw = self.detector.marker_length
+        pad_size = self.detector.pad_size
         bt = self.detector.block_thickness
 
         for pad, center_xy in self.pad_centers.items():
@@ -446,32 +502,45 @@ class HanoiTask:
             T_visual[:3, 3] = [float(center_xy[0]), float(center_xy[1]), -0.002]
             handle = self.renderer.add_box(
                 T_visual,
-                dimensions=(self.detector.pad_size, self.detector.pad_size, 0.004),
+                dimensions=(pad_size, pad_size, 0.004),
                 label=f"pad_{pad.name.lower()}",
                 color=PAD_COLORS[pad],
             )
             self._pad_handles[pad] = handle
 
-        for pad, stack in self.pad_stacks.items():
-            if pad not in self.pad_centers:
-                continue
-            center_xy = self.pad_centers[pad]
-            for i, box in enumerate(stack):
-                width = BOX_WIDTHS[box]
-                T_visual = np.eye(4, dtype=float)
-                T_visual[:3, 3] = [float(center_xy[0]), float(center_xy[1]), i * bt + bt / 2]
-                handle = self.renderer.add_box(
-                    T_visual,
-                    dimensions=(width, width, bt),
-                    label=f"box_{box.name.lower()}",
-                    color=BOX_COLORS[box],
-                )
-                self._box_handles[box] = handle
+            # Pad's ArUco tag sits in the bottom-left corner of the 20 cm pad,
+            # flush with the pad's top face. In the pad's local frame, bottom-left
+            # is -x, -y relative to the pad center.
+            T_tag = np.eye(4, dtype=float)
+            T_tag[:3, 3] = [-(pad_size - tw) / 2, -(pad_size - tw) / 2, 0.003]
+            self.renderer.add_aruco_tag(int(pad), T_tag, tw, parent=handle)
+
+        for box, center in self.block_centers.items():
+            width = BOX_WIDTHS[box]
+            T_visual = np.eye(4, dtype=float)
+            T_visual[:3, 3] = center
+            handle = self.renderer.add_box(
+                T_visual,
+                dimensions=(width, width, bt),
+                label=f"box_{box.name.lower()}",
+                color=BOX_COLORS[box],
+            )
+            self._box_handles[box] = handle
+
+            # Block's ArUco tag is in the bottom-left corner of its top face.
+            # Local frame of the block: origin at block center, +z up toward top face.
+            T_tag = np.eye(4, dtype=float)
+            T_tag[:3, 3] = [-(width - tw) / 2, -(width - tw) / 2, bt / 2 + 0.001]
+            self.renderer.add_aruco_tag(int(box), T_tag, tw, parent=handle)
 
     def _fake_detections(self) -> tuple[dict[BoxTag, np.ndarray], dict[PadTag, np.ndarray]]:
-        """Synthetic detections matching a standard Tower-of-Hanoi starting state.
+        """Synthetic detections matching the PDF's Tower-of-Hanoi starting state.
 
-        All three blocks start stacked on ``START_PAD``, middle and end pads empty.
+        All three blocks start stacked on ``START_PAD`` (middle and end empty).
+        Per the PDF, blocks are corner-stacked rather than centered so their
+        ArUco tags remain visible: each upper block sits in the "top-right
+        corner" of the block below it. We simulate that offset to exercise the
+        corner-aware grasp math.
         """
         bt = self.detector.block_thickness
         tw = self.detector.marker_length
@@ -486,16 +555,21 @@ class HanoiTask:
         }
         pads = {tag: make_T(center - pad_offset, R_id) for tag, center in pad_centers.items()}
 
-        # Stack all three blocks on START_PAD, largest on bottom:
-        # LARGE at index 0, MEDIUM at 1, SMALL at 2.
+        # Stack all three blocks on START_PAD, largest on bottom. Corner offset
+        # between adjacent blocks chosen so the smaller block's tag sits inside
+        # the footprint of the larger block below but near its top-right corner.
+        corner_dxy = 0.015  # 1.5 cm offset between adjacent blocks' centers, per lab setup
         start_xy = pad_centers[PadTag.START_PAD][:2]
         stack_order = [BoxTag.LARGE_BOX, BoxTag.MEDIUM_BOX, BoxTag.SMALL_BOX]
         boxes: dict[BoxTag, np.ndarray] = {}
         for i, tag in enumerate(stack_order):
             w = BOX_WIDTHS[tag]
-            # Block center (what grasp_pose_for should land at).
-            center = np.array([start_xy[0], start_xy[1], i * bt + bt / 2], dtype=float)
-            # Back out the ArUco position: grasp_pose_for applies R_tool @ (w/2, tw/2, -bt/2).
+            # Block center = pad xy + accumulated corner offset, z = stack height.
+            center = np.array(
+                [start_xy[0] + i * corner_dxy, start_xy[1] + i * corner_dxy, i * bt + bt / 2],
+                dtype=float,
+            )
+            # Back out the ArUco position: grasp_pose_for applies R @ (w/2, tw/2, -bt/2).
             local = np.array([w / 2, tw / 2, -bt / 2], dtype=float)
             aruco_pos = center - R_id @ local
             boxes[tag] = make_T(aruco_pos, R_id)
@@ -526,9 +600,12 @@ class HanoiTask:
             return False
         self.home()
 
-        # Update the world model.
+        # Update the world model. After a place the block lives at the
+        # destination pad's center at the new stack height, not wherever the
+        # detection originally put it.
         self.pad_stacks[src].pop()
         self.pad_stacks[dst].append(top_box)
+        self.block_centers[top_box] = place_pose[:3, 3].copy()
         return True
 
     def solve_tower_of_hanoi(
@@ -568,8 +645,11 @@ class HanoiTask:
         return success
 
     def run(self) -> None:
-        """``home -> scan -> populate_scene -> solve_tower_of_hanoi -> home``."""
+        """``home -> open gripper -> scan -> populate_scene -> solve -> home``."""
         self.home()
+        # Guarantee a known gripper state before any grasping; a previously closed
+        # gripper would otherwise slam its fingers into the first block.
+        self.controller.gripper_open()
 
         if self.camera is None and self.controller.simulate:
             if self.controller.verbose:
@@ -579,9 +659,15 @@ class HanoiTask:
         else:
             self.scan()
 
-        missing_pads = [p for p in PadTag if p not in self.pad_centers]
-        if missing_pads and not self.controller.simulate:
-            raise ValueError(f"HanoiTask.run: missing required pads: {missing_pads}")
+        if not self.controller.simulate:
+            missing_pads = [p for p in PadTag if p not in self.pad_centers]
+            missing_boxes = [b for b in BoxTag if b not in self.block_centers]
+            if missing_pads or missing_boxes:
+                missing = [t.name for t in (*missing_pads, *missing_boxes)]
+                raise ValueError(
+                    f"HanoiTask.run: scan did not find all required tags (missing: {missing}). "
+                    "Check camera exposure and scan point coverage."
+                )
 
         self.populate_scene()
         self.solve_tower_of_hanoi()
