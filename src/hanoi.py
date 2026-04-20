@@ -300,16 +300,16 @@ def _scan_detections_complete(
     return len(box_detections) == len(BoxTag) and len(pad_detections) == len(PadTag)
 
 
-def _default_scan_points(scan_height: float = 0.4) -> np.ndarray:
+def _default_scan_points(scan_height: float = 0.5) -> np.ndarray:
     """Six scan positions tiled across :data:`TAG_WORKSPACE_*` in the base frame."""
     return np.array(
         [
-            [-0.35, -0.33, scan_height],
-            [0.0, -0.33, scan_height],
-            [0.35, -0.33, scan_height],
-            [-0.35, -0.67, scan_height],
-            [0.0, -0.67, scan_height],
-            [0.35, -0.67, scan_height],
+            [-0.35, -0.23, scan_height],
+            [0.0, -0.23, scan_height],
+            [0.35, -0.23, scan_height],
+            [-0.35, -0.57, scan_height],
+            [0.0, -0.57, scan_height],
+            [0.35, -0.57, scan_height],
         ],
         dtype=float,
     )
