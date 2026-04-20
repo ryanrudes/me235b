@@ -40,6 +40,29 @@ from .transforms import R_to_wxyz
 # FK with the URDF to ~1e-11 m at joint, wrist, and tool frames.
 UR10E_JOINT_OFFSET: np.ndarray = np.array([np.pi, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
 
+# Lab 3 "frame 5 to camera" mount — ViserRenderer needs this independently of HanoiTask
+# so it can position the on-arm camera body and simulate the live camera view.
+T5C_LAB3: np.ndarray = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, -0.1016],
+        [0.0, 0.0, 1.0, 0.0848],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
+
+# Lab 3 camera intrinsics from the PDF (Part 1 (c)). Same values ``HanoiDetector``
+# uses — duplicated here so the renderer stays decoupled from the detector module.
+LAB3_CAMERA_K: np.ndarray = np.array(
+    [[1698.75, 0.0, 1115.55], [0.0, 1695.98, 751.98], [0.0, 0.0, 1.0]],
+    dtype=float,
+)
+LAB3_CAMERA_D: np.ndarray = np.array(
+    [-0.00670872, -0.1481124, -0.00250596, 0.00299921, -1.68711031],
+    dtype=float,
+)
+
 
 # --- ROS-Industrial Robotiq URDF fetcher -------------------------------------
 #
@@ -326,6 +349,11 @@ class ViserRenderer(SimulationRenderer):
         show_tool_target_frame: bool = True,
         show_gripper: bool = True,
         gripper_type: str = "robotiq_2f140",
+        show_arm_camera: bool = True,
+        show_camera_view: bool = True,
+        camera_view_size: tuple[int, int] = (320, 240),
+        camera_view_distortion: bool = False,
+        T5c: np.ndarray | None = None,
     ) -> None:
         try:
             import viser
@@ -343,6 +371,7 @@ class ViserRenderer(SimulationRenderer):
         else:
             self.joint_offset = np.asarray(joint_offset, dtype=float).reshape(6)
         self.frame_dt = 1.0 / float(frame_rate)
+        self.T5c = T5C_LAB3.copy() if T5c is None else np.asarray(T5c, dtype=float)
 
         self.server = viser.ViserServer(verbose=False)
         try:
@@ -385,6 +414,13 @@ class ViserRenderer(SimulationRenderer):
         self._object_handles: dict[str, Any] = {}
         self._object_local: dict[str, np.ndarray] = {}  # pose relative to end effector while attached
         self._attached: set[str] = set()
+
+        # World-pose bookkeeping for the simulated camera view. We track top-level
+        # object poses here (updated in set_object_pose / attach_to_end_effector).
+        # Child primitives (ArUco tags) compose their parent's world pose with
+        # their own recorded local offset at render time.
+        self._world_poses: dict[str, np.ndarray] = {}
+        self._primitives: list[dict[str, Any]] = []
 
         self._trail_counter = 0
         self._prev_point: np.ndarray | None = None
@@ -441,6 +477,65 @@ class ViserRenderer(SimulationRenderer):
             self._update_gripper_pose(self._current_q)
             self.on_gripper("open")
 
+        # Arm-mounted camera body: a dark cuboid parented to a frame that
+        # tracks frame 5, with the body offset by the T5c origin so the visual
+        # sits exactly where the physical camera is bolted on. We add a small
+        # lens cylinder-ish cuboid too for visual clarity.
+        self._camera_arm_frame: Any | None = None
+        if show_arm_camera:
+            self._camera_arm_frame = self.server.scene.add_frame(
+                "/camera_mount", show_axes=False
+            )
+            camera_body_pos = tuple(float(v) for v in self.T5c[:3, 3])
+            self.server.scene.add_box(
+                "/camera_mount/body",
+                dimensions=(0.04, 0.025, 0.030),
+                color=(25, 25, 30),
+                wxyz=R_to_wxyz(self.T5c[:3, :3]),
+                position=camera_body_pos,
+            )
+            lens_offset = np.asarray(self.T5c[:3, 3], dtype=float) + self.T5c[:3, :3] @ np.array([0.0, 0.0, 0.018])
+            self.server.scene.add_box(
+                "/camera_mount/lens",
+                dimensions=(0.016, 0.016, 0.008),
+                color=(70, 70, 90),
+                wxyz=R_to_wxyz(self.T5c[:3, :3]),
+                position=tuple(float(v) for v in lens_offset),
+            )
+            self._update_camera_mount_pose(self._current_q)
+
+        # GUI camera view panel: simulated image from the on-arm camera, rendered
+        # each joint step via cv2.projectPoints + warpPerspective.
+        #
+        # To avoid stretching the rendered scene we snap the panel height to the
+        # native camera's aspect (~1.48:1). Real pixels are square so fx should
+        # equal fy; scaling fx and fy by different factors would warp the image.
+        native_w = float(2 * LAB3_CAMERA_K[0, 2])
+        native_h = float(2 * LAB3_CAMERA_K[1, 2])
+        panel_w = int(camera_view_size[0])
+        panel_h = int(round(panel_w * native_h / native_w))
+        self._camera_view_size: tuple[int, int] = (panel_w, panel_h)
+        self._camera_view_K: np.ndarray | None = None
+        self._camera_view_D: np.ndarray | None = None
+        self._gui_camera_image: Any | None = None
+        if show_camera_view:
+            s = panel_w / native_w
+            self._camera_view_K = LAB3_CAMERA_K.copy()
+            self._camera_view_K[0, 0] *= s
+            self._camera_view_K[1, 1] *= s
+            self._camera_view_K[0, 2] *= s
+            self._camera_view_K[1, 2] *= s
+            # By default render a pinhole view (no distortion). The real Lab 3
+            # camera has k3 ~= -1.7 which bends straight edges dramatically, and
+            # interpolating colored polygons between distorted corners produces
+            # misleading "wings" at the image periphery. Flip on for realism.
+            self._camera_view_D = LAB3_CAMERA_D.copy() if camera_view_distortion else np.zeros(5, dtype=float)
+            placeholder = np.full((panel_h, panel_w, 3), 60, dtype=np.uint8)
+            self._gui_camera_image = self.server.gui.add_image(
+                placeholder,
+                label="Camera view (arm)",
+            )
+
         with self.server.gui.add_folder("Simulation"):
             self._gui_step_label = self.server.gui.add_text("Last step", "idle", disabled=True)
             self._gui_gripper_label = self.server.gui.add_text("Gripper", "open", disabled=True)
@@ -472,6 +567,204 @@ class ViserRenderer(SimulationRenderer):
             self._gripper_handle.wxyz = tuple(float(v) for v in R_to_wxyz(T_center[:3, :3]))
             self._gripper_handle.position = tuple(float(v) for v in T_center[:3, 3])
 
+    def _update_camera_mount_pose(self, q: np.ndarray) -> None:
+        if self._camera_arm_frame is None:
+            return
+        T_b5 = self.kin.fk_to_frame(q, 5)
+        self._camera_arm_frame.wxyz = tuple(float(v) for v in R_to_wxyz(T_b5[:3, :3]))
+        self._camera_arm_frame.position = tuple(float(v) for v in T_b5[:3, 3])
+
+    def _primitive_world_pose(self, prim: dict[str, Any]) -> np.ndarray | None:
+        """World pose of a scene primitive; composes parent + local for tags."""
+        parent = prim["parent"]
+        if parent:
+            base = self._world_poses.get(parent)
+            if base is None:
+                return None
+            return base @ prim["local_T"]
+        return self._world_poses.get(prim["path"])
+
+    def _render_camera_view(self, q: np.ndarray) -> None:
+        if self._gui_camera_image is None or self._camera_view_K is None:
+            return
+
+        import cv2
+
+        T_base_cam = self.kin.fk_to_frame(q, 5) @ self.T5c
+        T_cam_base = np.linalg.inv(T_base_cam)
+        R_cw = T_cam_base[:3, :3]
+        t_cw = T_cam_base[:3, 3]
+        rvec, _ = cv2.Rodrigues(R_cw)
+        tvec = t_cw.reshape(3, 1)
+        K = self._camera_view_K
+        D = self._camera_view_D
+        W, H = self._camera_view_size
+
+        img = np.full((H, W, 3), 40, dtype=np.uint8)
+
+        # Collect drawable items with their world poses + depth key.
+        drawables: list[tuple[float, str, dict[str, Any], np.ndarray]] = []
+        for prim in self._primitives:
+            T_world = self._primitive_world_pose(prim)
+            if T_world is None:
+                continue
+            origin_cam = R_cw @ T_world[:3, 3] + t_cw
+            if origin_cam[2] <= 0.01:
+                continue
+            drawables.append((float(origin_cam[2]), prim["kind"], prim, T_world))
+
+        # Painter's algorithm: far objects first.
+        drawables.sort(key=lambda x: -x[0])
+
+        for _z, kind, prim, T_world in drawables:
+            try:
+                if kind == "box":
+                    self._draw_box_primitive(img, prim, T_world, rvec, tvec, K, D)
+                elif kind == "tag":
+                    self._draw_tag_primitive(img, prim, T_world, rvec, tvec, K, D)
+            except Exception:
+                continue
+
+        self._gui_camera_image.image = img
+
+    def _project(self, points_world: np.ndarray, rvec, tvec, K, D) -> np.ndarray:
+        import cv2
+
+        img_pts, _ = cv2.projectPoints(points_world.astype(np.float64), rvec, tvec, K, D)
+        return img_pts.reshape(-1, 2)
+
+    def _draw_box_primitive(
+        self,
+        img: np.ndarray,
+        prim: dict[str, Any],
+        T_world: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+    ) -> None:
+        import cv2
+
+        dx, dy, dz = prim["dims"]
+        r, g, b = prim["color"]
+        # 8 corners in the box's local frame.
+        sx, sy, sz = dx / 2, dy / 2, dz / 2
+        local_corners = np.array(
+            [
+                [-sx, -sy, -sz], [sx, -sy, -sz], [sx, sy, -sz], [-sx, sy, -sz],
+                [-sx, -sy, sz],  [sx, -sy, sz],  [sx, sy, sz],  [-sx, sy, sz],
+            ],
+            dtype=float,
+        )
+        world_corners = (T_world[:3, :3] @ local_corners.T).T + T_world[:3, 3]
+
+        # Skip rendering if any corner is behind the camera (projectPoints returns
+        # NaN/absurd values in that case and the integer cast blows up).
+        R_cw_full = cv2.Rodrigues(rvec)[0]
+        corners_cam_z = (R_cw_full @ world_corners.T).T[:, 2] + tvec.reshape(3)[2]
+        if np.any(corners_cam_z <= 0.01):
+            return
+        corners_2d = self._project(world_corners, rvec, tvec, K, D)
+        if not np.all(np.isfinite(corners_2d)):
+            return
+
+        # 6 faces, each as 4 indices into world_corners (CCW viewed from outside).
+        faces = [
+            (0, 3, 2, 1),  # -z
+            (4, 5, 6, 7),  # +z
+            (0, 1, 5, 4),  # -y
+            (2, 3, 7, 6),  # +y
+            (1, 2, 6, 5),  # +x
+            (0, 4, 7, 3),  # -x
+        ]
+
+        R_cw = cv2.Rodrigues(rvec)[0]
+        cam_origin_world = -R_cw.T @ tvec.reshape(3)
+
+        # Sort faces by depth descending (paint far first).
+        def face_depth(f):
+            center = world_corners[list(f)].mean(axis=0)
+            return -float(np.linalg.norm(center - cam_origin_world))
+
+        for face in sorted(faces, key=face_depth):
+            centroid = world_corners[list(face)].mean(axis=0)
+            # Face normal in world = cross of (p1-p0) x (p3-p0) (approx, CCW order).
+            p0, p1, p2, p3 = [world_corners[i] for i in face]
+            normal = np.cross(p1 - p0, p3 - p0)
+            n = np.linalg.norm(normal)
+            if n > 1e-9:
+                normal /= n
+                # If normal points away from camera, skip (back-face cull).
+                if np.dot(normal, centroid - cam_origin_world) >= 0:
+                    continue
+
+            # cv2.projectPoints under distortion can produce large or NaN
+            # values for points near the optical axis - clip before casting.
+            face_pts = np.array([corners_2d[i] for i in face], dtype=float)
+            if not np.all(np.isfinite(face_pts)):
+                continue
+            face_pts = np.clip(face_pts, -32000, 32000)
+            pts = face_pts.astype(np.int32)
+            # Very lambertian-ish shading: darken faces whose normal is nearly parallel to view.
+            if n > 1e-9:
+                view_dir = (cam_origin_world - centroid) / max(np.linalg.norm(cam_origin_world - centroid), 1e-6)
+                brightness = 0.6 + 0.4 * float(max(0.0, np.dot(normal, view_dir)))
+            else:
+                brightness = 1.0
+            # viser GUI images are RGB; our prim["color"] is (r, g, b) so we
+            # write the triple in RGB order. (Earlier code had a B/R swap bug.)
+            fill = (
+                int(np.clip(r * brightness, 0, 255)),
+                int(np.clip(g * brightness, 0, 255)),
+                int(np.clip(b * brightness, 0, 255)),
+            )
+            cv2.fillConvexPoly(img, pts, fill)
+            cv2.polylines(img, [pts], True, (10, 10, 10), 1, cv2.LINE_AA)
+
+    def _draw_tag_primitive(
+        self,
+        img: np.ndarray,
+        prim: dict[str, Any],
+        T_world: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+    ) -> None:
+        import cv2
+
+        size = prim["size_m"]
+        s = size / 2
+        local_corners = np.array(
+            [[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]],
+            dtype=float,
+        )
+        world_corners = (T_world[:3, :3] @ local_corners.T).T + T_world[:3, 3]
+        corners_2d = self._project(world_corners, rvec, tvec, K, D).astype(np.float32)
+        if not np.all(np.isfinite(corners_2d)):
+            return
+
+        tag_img = prim["image"]
+        Hs = tag_img.shape[0]
+        Ws = tag_img.shape[1]
+        src = np.array(
+            [[0, 0], [Ws - 1, 0], [Ws - 1, Hs - 1], [0, Hs - 1]],
+            dtype=np.float32,
+        )
+        try:
+            M = cv2.getPerspectiveTransform(src, corners_2d)
+        except cv2.error:
+            return
+
+        H_img, W_img = img.shape[:2]
+        warped = cv2.warpPerspective(tag_img, M, (W_img, H_img))
+        # Use the warped image where it's non-zero (tag pixels).
+        mask = cv2.warpPerspective(
+            np.full((Hs, Ws), 255, dtype=np.uint8), M, (W_img, H_img)
+        )
+        mask3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
+        img[:] = (mask3 * warped + (1 - mask3) * img).astype(np.uint8)
+
     def on_joint_step(self, q_class: np.ndarray, *, duration: float = 0.4) -> None:
         q_target = np.asarray(q_class, dtype=float).reshape(6)
         q_start = self._current_q.copy()
@@ -483,8 +776,10 @@ class ViserRenderer(SimulationRenderer):
             self.viser_urdf.update_cfg(q_interp + self.joint_offset)
             self._update_target_frame(q_interp)
             self._update_gripper_pose(q_interp)
+            self._update_camera_mount_pose(q_interp)
             if self._attached:
                 self._reposition_attached(q_interp)
+            self._render_camera_view(q_interp)
             time.sleep(self.frame_dt)
 
         self._current_q = q_target.copy()
@@ -517,14 +812,20 @@ class ViserRenderer(SimulationRenderer):
         self._object_counter += 1
         name = f"/objects/{label}_{self._object_counter}"
         T = np.asarray(T, dtype=float)
+        dims = tuple(float(d) for d in dimensions)
+        col = tuple(int(c) for c in color)
         handle = self.server.scene.add_box(
             name,
-            dimensions=tuple(float(d) for d in dimensions),
-            color=tuple(int(c) for c in color),
+            dimensions=dims,
+            color=col,
             wxyz=R_to_wxyz(T[:3, :3]),
             position=tuple(float(v) for v in T[:3, 3]),
         )
         self._object_handles[name] = handle
+        self._world_poses[name] = T.copy()
+        self._primitives.append(
+            {"kind": "box", "path": name, "parent": "", "local_T": np.eye(4), "dims": dims, "color": col}
+        )
         return name
 
     def set_object_pose(self, handle: str, T: np.ndarray) -> None:
@@ -534,6 +835,7 @@ class ViserRenderer(SimulationRenderer):
         obj = self._object_handles[handle]
         obj.wxyz = tuple(float(q) for q in R_to_wxyz(T[:3, :3]))
         obj.position = tuple(float(v) for v in T[:3, 3])
+        self._world_poses[handle] = T.copy()
 
     def add_aruco_tag(
         self,
@@ -566,6 +868,16 @@ class ViserRenderer(SimulationRenderer):
             position=tuple(float(v) for v in T[:3, 3]),
         )
         self._object_handles[name] = handle
+        if parent:
+            # Child tag: record local offset so we can compose world pose at render time.
+            self._primitives.append(
+                {"kind": "tag", "path": name, "parent": parent, "local_T": T.copy(), "size_m": float(size_m), "image": img}
+            )
+        else:
+            self._world_poses[name] = T.copy()
+            self._primitives.append(
+                {"kind": "tag", "path": name, "parent": "", "local_T": np.eye(4), "size_m": float(size_m), "image": img}
+            )
         return name
 
     def attach_to_end_effector(self, handle: str) -> None:
