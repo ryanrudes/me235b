@@ -50,6 +50,20 @@ def wrap_to_pi(x):
     return (x + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def shortest_joint_motion_target(
+    q_from: np.ndarray, q_to: np.ndarray,
+) -> np.ndarray:
+    """Same configuration as ``q_to``, continuing smoothly from ``q_from``.
+
+    IK returns angles in ``(-π, π]``; the next solve may pick an equivalent
+    branch (often wrist joints) differing by ``2π``. Linear joint interpolation
+    would then sweep a full turn; here each joint changes by at most ``π``.
+    """
+    q_from = np.asarray(q_from, dtype=float).reshape(6)
+    q_to = np.asarray(q_to, dtype=float).reshape(6)
+    return q_from + wrap_to_pi(q_to - q_from)
+
+
 def so3_log(R: ArrayLike) -> np.ndarray:
     """SO(3) logarithm. Returns a rotation vector (axis * angle) for a 3x3 matrix."""
     R = np.asarray(R, dtype=float)

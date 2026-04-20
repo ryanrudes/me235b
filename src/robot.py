@@ -26,7 +26,7 @@ import numpy as np
 
 from .kinematics import UR10e
 from .sim import NullRenderer, SimulationRenderer
-from .transforms import so3_log
+from .transforms import shortest_joint_motion_target, so3_log
 
 
 class RobotController:
@@ -110,21 +110,23 @@ class RobotController:
     def movej(self, q_class, *, wait: bool = True) -> np.ndarray:
         """Safety-filter and dispatch a ``movej``. Returns the issued classical joints."""
         q_class = np.asarray(q_class, dtype=float).reshape(6)
-        if self.kin.external_safety_filter is not None and not self.kin.external_safety_filter(q_class):
+        q_cmd = shortest_joint_motion_target(self.current_q_class, q_class)
+        self.renderer.on_demo_checkpoint()
+        if self.kin.external_safety_filter is not None and not self.kin.external_safety_filter(q_cmd):
             raise RuntimeError("movej: rejected by external safety filter.")
 
         if self.simulate:
             if self.verbose:
-                print(f"[robot:sim] movej: {np.array2string(q_class, precision=4)}")
+                print(f"[robot:sim] movej: {np.array2string(q_cmd, precision=4)}")
         elif self.dry_run:
             if self.verbose:
-                print(f"[robot:dry] movej: {np.array2string(q_class, precision=4)}")
+                print(f"[robot:dry] movej: {np.array2string(q_cmd, precision=4)}")
         else:
-            self._dispatch_movej(q_class, wait=wait)
+            self._dispatch_movej(q_cmd, wait=wait)
 
-        self.renderer.on_joint_step(q_class, duration=self.step_duration)
-        self.current_q_class = q_class.copy()
-        return q_class
+        self.renderer.on_joint_step(q_cmd, duration=self.step_duration)
+        self.current_q_class = q_cmd.copy()
+        return q_cmd
 
     def translate(self, dx: float, dy: float, dz: float, *, wait: bool = True) -> tuple[float, float, float]:
         """Cartesian translate. In simulate / dry-run mode the move is emulated via IK."""
@@ -157,8 +159,10 @@ class RobotController:
             return
 
         q_new = self.kin.dh_modified_to_classical(theta_mod)
-        self.renderer.on_joint_step(q_new, duration=self.step_duration)
-        self.current_q_class = q_new.copy()
+        q_cmd = shortest_joint_motion_target(self.current_q_class, q_new)
+        self.renderer.on_demo_checkpoint()
+        self.renderer.on_joint_step(q_cmd, duration=self.step_duration)
+        self.current_q_class = q_cmd.copy()
         self.theta_seed = theta_mod.copy()
 
     def gripper_open(self) -> None:

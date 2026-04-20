@@ -29,6 +29,8 @@ Key facts from the Lab 3 spec that this module is built to respect:
 from __future__ import annotations
 
 from enum import Enum, IntEnum
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -38,7 +40,7 @@ from typing_extensions import Annotated
 from .detector import ArucoDetector
 from .kinematics import UR10e
 from .robot import RobotController
-from .sim import NullRenderer, SimulationRenderer
+from .sim import DemoAbort, NullRenderer, SimulationRenderer
 from .transforms import make_T, make_T_rpy
 
 
@@ -89,6 +91,42 @@ GRASP_ORIENTATION: np.ndarray = np.array(
 )
 
 
+def grasp_orientation_from_measured_tag(
+    T_base_aruco: np.ndarray,
+    *,
+    fallback: np.ndarray = GRASP_ORIENTATION,
+) -> np.ndarray:
+    """Gripper rotation (columns = gripper x,y,z expressed in base) from a tag pose.
+
+    Uses the ArUco marker frame from ``T_base_aruco`` (OpenCV convention: tag +z
+    is normal to the marker plane, pointing out of the pattern). Assumes the tag
+    lies on the block's top face so that **gripper +z** aligns with **−tag +z**
+    (top-down approach) and **gripper +x** follows the tag's in-plane x axis
+    (jaw closing direction per the lab PDF). Falls back to ``fallback`` if the
+    tag x axis is nearly parallel to the approach direction (degenerate).
+    """
+    Rm = np.asarray(T_base_aruco, dtype=float)[:3, :3]
+    e3 = np.array([0.0, 0.0, 1.0], dtype=float)
+    n_up = Rm @ e3
+    nlen = float(np.linalg.norm(n_up))
+    if nlen < 1e-9:
+        return np.asarray(fallback, dtype=float).copy()
+    n_up = n_up / nlen
+    ez = -n_up
+    tx = Rm @ np.array([1.0, 0.0, 0.0], dtype=float)
+    ex = tx - float(np.dot(tx, ez)) * ez
+    exn = float(np.linalg.norm(ex))
+    if exn < 1e-3:
+        return np.asarray(fallback, dtype=float).copy()
+    ex = ex / exn
+    ey = np.cross(ez, ex)
+    eyn = float(np.linalg.norm(ey))
+    if eyn < 1e-9:
+        return np.asarray(fallback, dtype=float).copy()
+    ey = ey / eyn
+    return np.stack([ex, ey, ez], axis=1)
+
+
 class HanoiDetector(ArucoDetector):
     """ArUco detector extended with 4x4 tag poses and Lab 3 grasp / place geometry."""
 
@@ -114,7 +152,13 @@ class HanoiDetector(ArucoDetector):
             results.append((int(tag_id), T))
         return results
 
-    def grasp_pose_for(self, tag: BoxTag, T_base_aruco: np.ndarray) -> np.ndarray:
+    def grasp_pose_for(
+        self,
+        tag: BoxTag,
+        T_base_aruco: np.ndarray,
+        *,
+        use_measured_tag_orientation: bool = False,
+    ) -> np.ndarray:
         """Base -> gripper-center transform for grasping the block at ``T_base_aruco``.
 
         Returns ``Tbg`` as defined in Lab 3 Part 2 prep (a): "transform between
@@ -123,9 +167,11 @@ class HanoiDetector(ArucoDetector):
 
         The block's ArUco tag sits in the bottom-left corner of the top face; the
         prism extends into the block's ``+x`` / ``+y`` / ``-z`` (below the tag).
-        The orientation is fixed to :data:`GRASP_ORIENTATION` — we ignore the
-        noisy measured ArUco rotation because the PDF guarantees blocks are
-        base-frame aligned.
+        By default the orientation is fixed to :data:`GRASP_ORIENTATION` — we
+        ignore the measured ArUco rotation because the PDF assumes blocks are
+        base-frame aligned. With ``use_measured_tag_orientation=True``, the
+        gripper z axis follows **−tag +z** and gripper x follows the tag's
+        in-plane x (see :func:`grasp_orientation_from_measured_tag`).
         """
         if tag not in BOX_WIDTHS:
             raise ValueError(f"grasp_pose_for: unknown box tag {tag!r}.")
@@ -139,7 +185,10 @@ class HanoiDetector(ArucoDetector):
         T_base_block = np.asarray(T_base_aruco, dtype=float) @ T_aruco_block
 
         T_grasp = np.eye(4, dtype=float)
-        T_grasp[:3, :3] = GRASP_ORIENTATION
+        if use_measured_tag_orientation:
+            T_grasp[:3, :3] = grasp_orientation_from_measured_tag(T_base_aruco)
+        else:
+            T_grasp[:3, :3] = GRASP_ORIENTATION
         T_grasp[:3, 3] = T_base_block[:3, 3]
         return T_grasp
 
@@ -162,8 +211,16 @@ class HanoiDetector(ArucoDetector):
         T_place[:3, 3] = place_pos
         return T_place
 
-    def grasp_dict(self, detections: dict[BoxTag, np.ndarray]) -> dict[BoxTag, np.ndarray]:
-        return {tag: self.grasp_pose_for(tag, T) for tag, T in detections.items()}
+    def grasp_dict(
+        self,
+        detections: dict[BoxTag, np.ndarray],
+        *,
+        use_measured_tag_orientation: bool = False,
+    ) -> dict[BoxTag, np.ndarray]:
+        return {
+            tag: self.grasp_pose_for(tag, T, use_measured_tag_orientation=use_measured_tag_orientation)
+            for tag, T in detections.items()
+        }
 
     def place_dict(self, detections: dict[PadTag, np.ndarray]) -> dict[PadTag, np.ndarray]:
         return {tag: self.place_pose_for(tag, T) for tag, T in detections.items()}
@@ -177,8 +234,74 @@ def _default_home_pose() -> np.ndarray:
     return T
 
 
+# Lab 3 horizontal workspace (base frame, metres): where pads and tags may appear.
+# Matches the scan tiling description in :func:`_default_scan_points` and the PDF.
+TAG_WORKSPACE_X_MIN: float = -0.7
+TAG_WORKSPACE_X_MAX: float = 0.7
+TAG_WORKSPACE_Y_MIN: float = -1.0
+TAG_WORKSPACE_Y_MAX: float = 0.0
+
+# Default pad geometric centers (base frame, metres) for synthetic / random layouts.
+DEFAULT_PAD_CENTERS_LAB3: dict[PadTag, np.ndarray] = {
+    PadTag.START_PAD: np.array([-0.20, -0.85, 0.0], dtype=float),
+    PadTag.MIDDLE_PAD: np.array([0.10, -0.85, 0.0], dtype=float),
+    PadTag.END_PAD: np.array([0.30, -0.85, 0.0], dtype=float),
+}
+
+
+def _pad_centers_xy_overlap(
+    c1: np.ndarray,
+    c2: np.ndarray,
+    pad_side: float,
+    *,
+    clearance: float = 0.02,
+) -> bool:
+    """True if two axis-aligned ``pad_side`` pads in the table plane would overlap (xy)."""
+    lim = float(pad_side) + float(clearance)
+    return bool(abs(float(c1[0]) - float(c2[0])) < lim and abs(float(c1[1]) - float(c2[1])) < lim)
+
+
+def _sample_non_overlapping_pad_centers(
+    rng: np.random.Generator,
+    pad_side: float,
+    *,
+    max_trials: int = 800,
+) -> dict[PadTag, np.ndarray]:
+    """Independent random pad centers in the tag workspace with no xy overlap."""
+    h = pad_side / 2
+    x_lo = TAG_WORKSPACE_X_MIN + h
+    x_hi = TAG_WORKSPACE_X_MAX - h
+    y_lo = TAG_WORKSPACE_Y_MIN + h
+    y_hi = TAG_WORKSPACE_Y_MAX - h
+    tags = list(PadTag)
+    for _ in range(max_trials):
+        pts = {
+            tag: np.array([rng.uniform(x_lo, x_hi), rng.uniform(y_lo, y_hi), 0.0], dtype=float)
+            for tag in tags
+        }
+        ok = True
+        for i, ti in enumerate(tags):
+            for tj in tags[i + 1 :]:
+                if _pad_centers_xy_overlap(pts[ti], pts[tj], pad_side):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            return pts
+    # Rare: keep the known-good default triangle (independent jitter could overlap).
+    return {tag: DEFAULT_PAD_CENTERS_LAB3[tag].copy() for tag in tags}
+
+
+def _scan_detections_complete(
+    box_detections: dict[BoxTag, np.ndarray], pad_detections: dict[PadTag, np.ndarray]
+) -> bool:
+    """True iff every lab tag ID appears in the scan merge dicts."""
+    return len(box_detections) == len(BoxTag) and len(pad_detections) == len(PadTag)
+
+
 def _default_scan_points(scan_height: float = 0.4) -> np.ndarray:
-    """Six scan positions tiled across the tag workspace ``x in [-0.7, 0.7], y in [-1, 0]``."""
+    """Six scan positions tiled across :data:`TAG_WORKSPACE_*` in the base frame."""
     return np.array(
         [
             [-0.35, -0.33, scan_height],
@@ -221,6 +344,9 @@ class HanoiTask:
         T5c: np.ndarray | None = None,
         scan_points: np.ndarray | None = None,
         approach_height: float = 0.08,
+        scan_settle_s: float = 0.0,
+        synthetic_scan_detection: bool = False,
+        tag_grasp_orientation: bool = False,
     ) -> None:
         self.controller = controller
         self.detector = detector
@@ -229,6 +355,15 @@ class HanoiTask:
         self.T5c = T5C_DEFAULT if T5c is None else np.asarray(T5c, dtype=float)
         self.scan_points = _default_scan_points() if scan_points is None else np.asarray(scan_points, dtype=float)
         self.approach_height = float(approach_height)
+        self.scan_settle_s = float(scan_settle_s)
+        self.synthetic_scan_detection = bool(synthetic_scan_detection)
+        self.tag_grasp_orientation = bool(tag_grasp_orientation)
+        self._demo_layout_cp: tuple[
+            dict[PadTag, np.ndarray],
+            dict[PadTag, list[BoxTag]],
+            dict[BoxTag, np.ndarray],
+            dict[BoxTag, np.ndarray],
+        ] | None = None
 
         # Camera-side kinematics: IK targets are camera poses ~= T_b6 @ T5c.
         # (The exact camera pose is T_B5 @ T5c, which differs by the joint-6
@@ -256,6 +391,10 @@ class HanoiTask:
         self.pad_centers: dict[PadTag, np.ndarray] = {}
         self.pad_stacks: dict[PadTag, list[BoxTag]] = {p: [] for p in PadTag}
         self.block_centers: dict[BoxTag, np.ndarray] = {}
+        # When :attr:`tag_grasp_orientation` is True: last 3x3 gripper rotation (base frame)
+        # per block, from the tag at scan time; reset to :data:`GRASP_ORIENTATION`
+        # after each axis-aligned :meth:`place_pose_for_top` placement.
+        self._block_grasp_R: dict[BoxTag, np.ndarray] = {}
 
     @property
     def renderer(self) -> SimulationRenderer:
@@ -289,11 +428,30 @@ class HanoiTask:
 
     def scan(self) -> tuple[dict[BoxTag, np.ndarray], dict[PadTag, np.ndarray]]:
         """Drive the camera through each scan point, collect base-frame tag poses,
-        then update the internal world model (pad centers + stacks)."""
+        then update the internal world model (pad centers + stacks).
+
+        After each successful move, :attr:`scan_settle_s` seconds of stillness
+        elapse before reading the camera or refreshing scan snapshots (helps
+        rolling-shutter webcams and motion blur).
+
+        If ``self.camera`` is ``None`` and :attr:`synthetic_scan_detection` is
+        false, only motions run; returned detections are empty and
+        :meth:`_ingest_detections` is not called (caller supplies poses).
+
+        If ``synthetic_scan_detection`` is true (Viser path), a synthetic
+        full-resolution frame is rendered with the same **K** (and image size)
+        as :class:`HanoiDetector` but **without** lens distortion in the raster
+        (distortion + flat mesh/tag warps looked unrealistic); ``find_tag_poses``
+        still uses the lab distortion vector in ``solvePnP``. A complete tag set
+        is ingested; otherwise the prior model is left unchanged.
+        """
         box_detections: dict[BoxTag, np.ndarray] = {}
         pad_detections: dict[PadTag, np.ndarray] = {}
 
-        for scan_point in self.scan_points:
+        self.renderer.clear_scan_pose_estimates()
+
+        n_scan = len(self.scan_points)
+        for scan_index, scan_point in enumerate(self.scan_points):
             T_bc = make_T_rpy(scan_point, [np.pi, 0.0, 0.0])
             ok, _theta, info = self.controller.move_to_pose(T_bc, kinematics=self.camera_kin)
             if not ok:
@@ -301,10 +459,22 @@ class HanoiTask:
                     print(f"[hanoi] scan move IK failed at {scan_point}: {info.get('message','')}")
                 continue
 
-            if self.camera is None:
-                continue
+            if self.scan_settle_s > 0.0:
+                time.sleep(self.scan_settle_s)
 
-            frame = self._grab_frame()
+            frame = self._grab_frame() if self.camera is not None else None
+            if frame is None and self.camera is None and self.synthetic_scan_detection:
+                synth = getattr(self.renderer, "synthetic_camera_bgr_for_pose", None)
+                if callable(synth):
+                    frame = synth(self.controller.current_q_class)
+
+            self.renderer.on_scan_snapshot(
+                scan_index,
+                total=n_scan,
+                q=self.controller.current_q_class,
+                frame_bgr=frame,
+            )
+
             if frame is None:
                 continue
 
@@ -316,19 +486,57 @@ class HanoiTask:
                 try:
                     box = BoxTag(tag_id)
                     box_detections[box] = T_base_marker
+                    self.renderer.add_scan_pose_estimate(f"scan{scan_index}_box{tag_id}", T_base_marker)
                     continue
                 except ValueError:
                     pass
                 try:
                     pad = PadTag(tag_id)
                     pad_detections[pad] = T_base_marker
+                    self.renderer.add_scan_pose_estimate(f"scan{scan_index}_pad{tag_id}", T_base_marker)
                     continue
                 except ValueError:
                     pass
                 if self.controller.verbose:
                     print(f"[hanoi] ignoring non-Hanoi tag id={tag_id}")
 
-        self._ingest_detections(box_detections, pad_detections)
+            self.renderer.on_demo_checkpoint()
+
+        ingest = False
+        if self.camera is not None:
+            ingest = True
+        elif (
+            self.controller.simulate
+            and self.synthetic_scan_detection
+            and _scan_detections_complete(box_detections, pad_detections)
+        ):
+            ingest = True
+        elif (
+            self.controller.simulate
+            and self.synthetic_scan_detection
+            and self.controller.verbose
+            and (box_detections or pad_detections)
+            and not _scan_detections_complete(box_detections, pad_detections)
+        ):
+            print(
+                "[hanoi] synthetic camera scan: incomplete tag set at this merge; "
+                "keeping prior world model unless a later scan pose fills all IDs."
+            )
+
+        if ingest:
+            self._ingest_detections(box_detections, pad_detections)
+        elif (
+            self.controller.simulate
+            and self.synthetic_scan_detection
+            and self.camera is None
+            and not (box_detections or pad_detections)
+            and self.controller.verbose
+        ):
+            print(
+                "[hanoi] synthetic camera scan: no tags detected in rendered views "
+                "(check Viser scene / intrinsics)."
+            )
+
         return box_detections, pad_detections
 
     def _ingest_detections(
@@ -358,6 +566,7 @@ class HanoiTask:
 
         self.pad_stacks = {p: [] for p in PadTag}
         self.block_centers.clear()
+        self._block_grasp_R.clear()
 
         if not self.pad_centers:
             return
@@ -366,8 +575,14 @@ class HanoiTask:
         # and assign the block to the pad whose center it is xy-closest to.
         block_xy: dict[BoxTag, np.ndarray] = {}
         for box, T_aruco in box_detections.items():
-            T_block = self.detector.grasp_pose_for(box, T_aruco)
+            T_block = self.detector.grasp_pose_for(
+                box,
+                T_aruco,
+                use_measured_tag_orientation=self.tag_grasp_orientation,
+            )
             block_xy[box] = T_block[:3, 3][:2].copy()
+            if self.tag_grasp_orientation:
+                self._block_grasp_R[box] = grasp_orientation_from_measured_tag(T_aruco)
 
             closest_pad = min(
                 self.pad_centers,
@@ -390,10 +605,10 @@ class HanoiTask:
                     dtype=float,
                 )
 
-    def _pose_from_center(self, center_xyz: np.ndarray) -> np.ndarray:
-        """Build a gripper pose targeting ``center_xyz`` with the clean downward approach."""
+    def _pose_from_center(self, center_xyz: np.ndarray, *, R: np.ndarray | None = None) -> np.ndarray:
+        """Build a gripper pose targeting ``center_xyz`` with rotation ``R`` (default PDF grasp)."""
         T = np.eye(4, dtype=float)
-        T[:3, :3] = GRASP_ORIENTATION
+        T[:3, :3] = GRASP_ORIENTATION if R is None else np.asarray(R, dtype=float)
         T[:3, 3] = np.asarray(center_xyz, dtype=float).reshape(3)
         return T
 
@@ -402,7 +617,8 @@ class HanoiTask:
 
         Uses the block's last-known base-frame center (from the initial scan, updated
         after each successful place) so corner-stacked starting blocks are still
-        grasped at their true xy.
+        grasped at their true xy. If :attr:`tag_grasp_orientation` is enabled, the
+        gripper rotation comes from :attr:`_block_grasp_R` (from the tag at scan).
         """
         stack = self.pad_stacks.get(pad, [])
         if not stack:
@@ -410,7 +626,10 @@ class HanoiTask:
         top_box = stack[-1]
         if top_box not in self.block_centers:
             raise RuntimeError(f"grasp_pose_for_top: no known center for {top_box.name}.")
-        return top_box, self._pose_from_center(self.block_centers[top_box])
+        R = None
+        if self.tag_grasp_orientation:
+            R = self._block_grasp_R.get(top_box)
+        return top_box, self._pose_from_center(self.block_centers[top_box], R=R)
 
     def place_pose_for_top(self, pad: PadTag) -> np.ndarray:
         """Return the gripper pose for landing the next block centrally on ``pad``.
@@ -490,6 +709,7 @@ class HanoiTask:
         moves rigidly with a grasped block) and positioned in the bottom-left
         corner of the host's top face, per the PDF convention.
         """
+        self.renderer.clear_hanoi_scene_objects()
         self._box_handles.clear()
         self._pad_handles.clear()
 
@@ -533,6 +753,61 @@ class HanoiTask:
             T_tag[:3, 3] = [-(width - tw) / 2, -(width - tw) / 2, bt / 2 + 0.001]
             self.renderer.add_aruco_tag(int(box), T_tag, tw, parent=handle)
 
+    def randomize_sim_layout(self) -> None:
+        """Pick random non-overlapping pad positions, then stack blocks on the start pad.
+
+        Only meaningful in simulation (used by the Viser interactive demo).
+        """
+        rng = np.random.default_rng()
+        pad_side = float(self.detector.pad_size)
+        pad_centers = _sample_non_overlapping_pad_centers(rng, pad_side)
+
+        pad_offset = np.array([self.detector.pad_size / 2, self.detector.pad_size / 2, 0.0], dtype=float)
+        R_id = np.eye(3, dtype=float)
+        pads = {tag: make_T(pad_centers[tag] - pad_offset, R_id) for tag in PadTag}
+
+        bt = self.detector.block_thickness
+        tw = self.detector.marker_length
+        corner_dxy = 0.015
+        start_xy = pad_centers[PadTag.START_PAD][:2]
+        stack_order = [BoxTag.LARGE_BOX, BoxTag.MEDIUM_BOX, BoxTag.SMALL_BOX]
+        boxes: dict[BoxTag, np.ndarray] = {}
+        for i, tag in enumerate(stack_order):
+            w = BOX_WIDTHS[tag]
+            center = np.array(
+                [start_xy[0] + i * corner_dxy, start_xy[1] + i * corner_dxy, i * bt + bt / 2],
+                dtype=float,
+            )
+            local = np.array([w / 2, tw / 2, -bt / 2], dtype=float)
+            aruco_pos = center - R_id @ local
+            boxes[tag] = make_T(aruco_pos, R_id)
+
+        self._ingest_detections(boxes, pads)
+        self.populate_scene()
+        self.renderer.clear_scan_pose_estimates()
+
+    def save_demo_layout_checkpoint(self) -> None:
+        self._demo_layout_cp = (
+            {k: v.copy() for k, v in self.pad_centers.items()},
+            {k: list(v) for k, v in self.pad_stacks.items()},
+            {k: v.copy() for k, v in self.block_centers.items()},
+            {k: v.copy() for k, v in self._block_grasp_R.items()},
+        )
+
+    def restore_demo_layout_checkpoint(self) -> None:
+        if self._demo_layout_cp is None:
+            return
+        if len(self._demo_layout_cp) == 4:
+            pc, ps, bc, bgr = self._demo_layout_cp
+            self._block_grasp_R = {k: v.copy() for k, v in bgr.items()}
+        else:
+            pc, ps, bc = self._demo_layout_cp[:3]  # legacy 3-tuple checkpoints
+            self._block_grasp_R.clear()
+        self.pad_centers = {k: v.copy() for k, v in pc.items()}
+        self.pad_stacks = {k: list(v) for k, v in ps.items()}
+        self.block_centers = {k: v.copy() for k, v in bc.items()}
+        self._holding = None
+
     def _fake_detections(self) -> tuple[dict[BoxTag, np.ndarray], dict[PadTag, np.ndarray]]:
         """Synthetic detections matching the PDF's Tower-of-Hanoi starting state.
 
@@ -548,11 +823,7 @@ class HanoiTask:
 
         # Pad ArUco corners (bottom-left corner in each pad's 20 cm square).
         pad_offset = np.array([self.detector.pad_size / 2, self.detector.pad_size / 2, 0.0], dtype=float)
-        pad_centers = {
-            PadTag.START_PAD: np.array([-0.20, -0.85, 0.0], dtype=float),
-            PadTag.MIDDLE_PAD: np.array([0.10, -0.85, 0.0], dtype=float),
-            PadTag.END_PAD: np.array([0.30, -0.85, 0.0], dtype=float),
-        }
+        pad_centers = {tag: v.copy() for tag, v in DEFAULT_PAD_CENTERS_LAB3.items()}
         pads = {tag: make_T(center - pad_offset, R_id) for tag, center in pad_centers.items()}
 
         # Stack all three blocks on START_PAD, largest on bottom. Corner offset
@@ -595,10 +866,10 @@ class HanoiTask:
 
         if not self.pick_up(top_box, grasp_pose):
             return False
-        self.home()
+        #self.home()
         if not self.place_down(dst, place_pose):
             return False
-        self.home()
+        #self.home()
 
         # Update the world model. After a place the block lives at the
         # destination pad's center at the new stack height, not wherever the
@@ -606,6 +877,9 @@ class HanoiTask:
         self.pad_stacks[src].pop()
         self.pad_stacks[dst].append(top_box)
         self.block_centers[top_box] = place_pose[:3, 3].copy()
+        if self.tag_grasp_orientation:
+            # :meth:`place_pose_for_top` uses axis-aligned PDF grasp; model the block likewise.
+            self._block_grasp_R[top_box] = GRASP_ORIENTATION.copy()
         return True
 
     def solve_tower_of_hanoi(
@@ -644,18 +918,46 @@ class HanoiTask:
         recurse(n, source, target, auxiliary)
         return success
 
-    def run(self) -> None:
+    def run(self, *, skip_sim_auto_seed: bool = False) -> None:
         """``home -> open gripper -> scan -> populate_scene -> solve -> home``."""
+        self._run_body(skip_sim_auto_seed=skip_sim_auto_seed)
+
+    def _run_body(self, *, skip_sim_auto_seed: bool) -> None:
+        """Implementation of :meth:`run`.
+
+        ``skip_sim_auto_seed`` (Viser interactive mode): skip the built-in
+        PDF seed; the scene is already laid out via :meth:`randomize_sim_layout`.
+        """
         self.home()
         # Guarantee a known gripper state before any grasping; a previously closed
         # gripper would otherwise slam its fingers into the first block.
         self.controller.gripper_open()
 
+        self.renderer.set_camera_scan_path(self.scan_points)
+        self.renderer.set_tag_workspace_outline(
+            TAG_WORKSPACE_X_MIN,
+            TAG_WORKSPACE_X_MAX,
+            TAG_WORKSPACE_Y_MIN,
+            TAG_WORKSPACE_Y_MAX,
+        )
+
+        pre_populated = False
         if self.camera is None and self.controller.simulate:
-            if self.controller.verbose:
-                print("[hanoi] no camera + simulate=True -> using synthetic detections.")
-            box_detections, pad_detections = self._fake_detections()
-            self._ingest_detections(box_detections, pad_detections)
+            if not skip_sim_auto_seed:
+                if self.controller.verbose:
+                    print(
+                        "[hanoi] no camera + simulate=True -> seed scene from PDF layout, "
+                        "then scan motion + synthetic views."
+                    )
+                box_detections, pad_detections = self._fake_detections()
+                self._ingest_detections(box_detections, pad_detections)
+                self.populate_scene()
+                pre_populated = True
+            else:
+                pre_populated = True
+            box_out, pad_out = self.scan()
+            if self.synthetic_scan_detection and _scan_detections_complete(box_out, pad_out):
+                self.populate_scene()
         else:
             self.scan()
 
@@ -669,7 +971,8 @@ class HanoiTask:
                     "Check camera exposure and scan point coverage."
                 )
 
-        self.populate_scene()
+        if not pre_populated:
+            self.populate_scene()
         self.solve_tower_of_hanoi()
         self.home()
 
@@ -700,10 +1003,45 @@ def run_hanoi(
     step_duration: Annotated[float, typer.Option(help="Seconds to animate each joint target in the renderer.")] = 0.4,
     tool_z_offset: Annotated[float, typer.Option(help="Distance from frame-6 to gripper center (meters). The Lab 3 spec says this is 0.20.")] = 0.20,
     approach_height: Annotated[float, typer.Option(help="Hover height above each grasp / place pose (meters).")] = 0.08,
+    scan_settle_s: Annotated[
+        float,
+        typer.Option(
+            help="Seconds to wait at each scan pose after the arm stops before "
+            "grabbing a frame (reduces rolling-shutter / motion blur on USB cameras). "
+            "Use 0 to skip.",
+        ),
+    ] = 0.25,
+    synthetic_scan_detection: Annotated[
+        bool,
+        typer.Option(
+            help="With --simulate and Viser, run ArUco on rendered camera frames "
+            "at lab intrinsics (instead of trusting seed geometry alone).",
+        ),
+    ] = True,
+    interactive_sim: Annotated[
+        bool,
+        typer.Option(
+            help="With --simulate and Viser, use setup controls (randomize, start), "
+            "pause/resume, and restart between runs. Ignored on real hardware.",
+        ),
+    ] = True,
+    tag_grasp_orientation: Annotated[
+        bool,
+        typer.Option(
+            help="Derive grasp orientation from each block's ArUco pose (yaw/tilt); "
+            "default uses fixed base-aligned grasp from the PDF.",
+        ),
+    ] = False,
 ) -> None:
     """Run the Lab 3 Tower-of-Hanoi sequence."""
     kin = UR10e(T6t=make_T([0.0, 0.0, float(tool_z_offset)]))
     renderer = _build_renderer(render, kin)
+    use_synth = bool(
+        simulate and synthetic_scan_detection and render is RenderMode.viser
+    )
+    use_interactive = bool(
+        simulate and interactive_sim and render is RenderMode.viser
+    )
     controller = RobotController(
         kin,
         simulate=simulate,
@@ -723,8 +1061,43 @@ def run_hanoi(
             if not camera.isOpened():
                 raise RuntimeError(f"run_hanoi: cv2.VideoCapture({camera_index}) failed to open.")
 
-        task = HanoiTask(controller, detector, camera=camera, approach_height=approach_height)
-        task.run()
+        task = HanoiTask(
+            controller,
+            detector,
+            camera=camera,
+            approach_height=approach_height,
+            scan_settle_s=scan_settle_s,
+            synthetic_scan_detection=use_synth,
+            tag_grasp_orientation=tag_grasp_orientation,
+        )
+        if use_interactive:
+            from .sim import ViserRenderer
+
+            assert isinstance(renderer, ViserRenderer)
+
+            def _demo_worker() -> None:
+                renderer.enable_interactive_sim_demo(task)
+                while True:
+                    renderer.wait_for_sim_demo_start()
+                    task.save_demo_layout_checkpoint()
+                    try:
+                        if renderer._btn_randomize is not None:
+                            renderer._btn_randomize.disabled = True
+                        task.run(skip_sim_auto_seed=True)
+                    except DemoAbort:
+                        task.restore_demo_layout_checkpoint()
+                        task.populate_scene()
+                    finally:
+                        if renderer._btn_randomize is not None:
+                            renderer._btn_randomize.disabled = False
+                        if renderer._gui_demo_status is not None:
+                            renderer._gui_demo_status.value = (
+                                "Ready for another run (Start) or new layout (Randomize)."
+                            )
+
+            threading.Thread(target=_demo_worker, daemon=True).start()
+        else:
+            task.run()
     finally:
         if camera is not None:
             camera.release()

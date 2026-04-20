@@ -22,9 +22,11 @@ from __future__ import annotations
 import builtins
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -33,6 +35,10 @@ import numpy as np
 
 from .kinematics import UR10e
 from .transforms import R_to_wxyz
+
+
+class DemoAbort(Exception):
+    """Cooperative exit from :meth:`me235b.hanoi.HanoiTask.run` (Viser restart)."""
 
 
 # The UR10e URDF's home pose (all joints = 0) differs from classical DH by a 180 degree
@@ -62,6 +68,23 @@ LAB3_CAMERA_D: np.ndarray = np.array(
     [-0.00670872, -0.1481124, -0.00250596, 0.00299921, -1.68711031],
     dtype=float,
 )
+
+
+def _lab3_scaled_pinhole_bundle(
+    panel_w: int, *, use_distortion: bool
+) -> tuple[tuple[int, int], np.ndarray, np.ndarray]:
+    """Return ``((W, H), K, D)`` for a Lab-3 style virtual image of width ``panel_w``."""
+    native_w = float(2 * LAB3_CAMERA_K[0, 2])
+    native_h = float(2 * LAB3_CAMERA_K[1, 2])
+    panel_h = int(round(int(panel_w) * native_h / native_w))
+    s = float(panel_w) / native_w
+    K = LAB3_CAMERA_K.copy()
+    K[0, 0] *= s
+    K[1, 1] *= s
+    K[0, 2] *= s
+    K[1, 2] *= s
+    D = LAB3_CAMERA_D.copy() if use_distortion else np.zeros(5, dtype=float)
+    return (int(panel_w), panel_h), K, D
 
 
 # --- ROS-Industrial Robotiq URDF fetcher -------------------------------------
@@ -311,6 +334,52 @@ class SimulationRenderer:
     def trail_point(self, p_world: np.ndarray, *, pen_down: bool) -> None:
         """Feed a single pen-tip sample. Consecutive pen-down samples form a stroke."""
 
+    def set_camera_scan_path(self, points_xyz: np.ndarray | None, *, visible: bool = True) -> None:
+        """Optional base-frame polyline through planned camera scan positions."""
+
+    def set_tag_workspace_outline(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        *,
+        z_table: float = 0.002,
+        visible: bool = True,
+    ) -> None:
+        """Optional rectangle on the table for the Lab-3 tag / tower workspace."""
+
+    def on_scan_snapshot(
+        self,
+        index: int,
+        *,
+        total: int,
+        q: np.ndarray | None = None,
+        frame_bgr: np.ndarray | None = None,
+    ) -> None:
+        """Record one of ``total`` scan images at pose ``q`` or from a live ``frame_bgr``."""
+
+    def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
+        """BGR pinhole view at lab ``K`` / resolution for ArUco, or ``None``."""
+
+    def clear_scan_pose_estimates(self) -> None:
+        """Remove transient scan-time pose markers from the scene."""
+
+    def clear_hanoi_scene_objects(self) -> None:
+        """Remove pads/boxes/tags added for Hanoi so the scene can be repopulated."""
+
+    def add_scan_pose_estimate(self, name: str, T: np.ndarray) -> None:
+        """Draw a small world-frame triad at an estimated tag pose (e.g. during scan)."""
+
+    def on_demo_checkpoint(self) -> None:
+        """Interactive Viser demo: honor pause / restart between motions."""
+
+    def enable_interactive_sim_demo(self, task: Any) -> None:
+        """Install Randomize / Start / Pause / Resume / Restart controls (Viser + sim only)."""
+
+    def wait_for_sim_demo_start(self) -> None:
+        """Block until the user clicks **Start** (no-op if interactive demo is off)."""
+
     def attach_to_end_effector(self, handle: str) -> None:
         """Make ``handle`` follow the tool frame on subsequent joint steps."""
 
@@ -350,6 +419,10 @@ class ViserRenderer(SimulationRenderer):
         show_gripper: bool = True,
         gripper_type: str = "robotiq_2f140",
         show_arm_camera: bool = True,
+        show_camera_scan_path: bool = True,
+        show_tag_workspace_outline: bool = True,
+        show_scan_gallery: bool = True,
+        scan_gallery_thumb_width: int = 200,
         show_camera_view: bool = True,
         camera_view_size: tuple[int, int] = (320, 240),
         camera_view_distortion: bool = False,
@@ -425,6 +498,22 @@ class ViserRenderer(SimulationRenderer):
         self._trail_counter = 0
         self._prev_point: np.ndarray | None = None
         self._prev_pen_down: bool = False
+        self._show_camera_scan_path: bool = bool(show_camera_scan_path)
+        self._scan_path_names: list[str] = []
+        self._show_tag_workspace_outline: bool = bool(show_tag_workspace_outline)
+        self._workspace_outline_names: list[str] = []
+        self._scan_pose_names: list[str] = []
+
+        self._demo_interactive: bool = False
+        self._sim_paused: bool = False
+        self._sim_abort_requested: bool = False
+        self._sim_start_event = threading.Event()
+        self._gui_demo_status: Any | None = None
+        self._btn_randomize: Any | None = None
+        self._btn_start: Any | None = None
+        self._btn_pause: Any | None = None
+        self._btn_resume: Any | None = None
+        self._btn_restart: Any | None = None
 
         self._target_frame: Any | None = None
         if show_tool_target_frame:
@@ -504,37 +593,45 @@ class ViserRenderer(SimulationRenderer):
             )
             self._update_camera_mount_pose(self._current_q)
 
-        # GUI camera view panel: simulated image from the on-arm camera, rendered
-        # each joint step via cv2.projectPoints + warpPerspective.
-        #
-        # To avoid stretching the rendered scene we snap the panel height to the
-        # native camera's aspect (~1.48:1). Real pixels are square so fx should
-        # equal fy; scaling fx and fy by different factors would warp the image.
-        native_w = float(2 * LAB3_CAMERA_K[0, 2])
-        native_h = float(2 * LAB3_CAMERA_K[1, 2])
-        panel_w = int(camera_view_size[0])
-        panel_h = int(round(panel_w * native_h / native_w))
-        self._camera_view_size: tuple[int, int] = (panel_w, panel_h)
+        # Live camera panel + per-scan thumbnails share the same Lab-3 intrinsics
+        # scaling; gallery can exist without the main floating preview.
+        self._camera_view_size: tuple[int, int] = (0, 0)
         self._camera_view_K: np.ndarray | None = None
         self._camera_view_D: np.ndarray | None = None
         self._gui_camera_image: Any | None = None
         if show_camera_view:
-            s = panel_w / native_w
-            self._camera_view_K = LAB3_CAMERA_K.copy()
-            self._camera_view_K[0, 0] *= s
-            self._camera_view_K[1, 1] *= s
-            self._camera_view_K[0, 2] *= s
-            self._camera_view_K[1, 2] *= s
-            # By default render a pinhole view (no distortion). The real Lab 3
-            # camera has k3 ~= -1.7 which bends straight edges dramatically, and
-            # interpolating colored polygons between distorted corners produces
-            # misleading "wings" at the image periphery. Flip on for realism.
-            self._camera_view_D = LAB3_CAMERA_D.copy() if camera_view_distortion else np.zeros(5, dtype=float)
-            placeholder = np.full((panel_h, panel_w, 3), 60, dtype=np.uint8)
+            pw = int(camera_view_size[0])
+            self._camera_view_size, self._camera_view_K, self._camera_view_D = _lab3_scaled_pinhole_bundle(
+                pw, use_distortion=camera_view_distortion
+            )
+            w, h = self._camera_view_size
+            placeholder = np.full((h, w, 3), 60, dtype=np.uint8)
             self._gui_camera_image = self.server.gui.add_image(
                 placeholder,
                 label="Camera view (arm)",
             )
+
+        self._show_scan_gallery: bool = bool(show_scan_gallery)
+        self._scan_gallery_size: tuple[int, int] = (0, 0)
+        self._scan_gallery_K: np.ndarray | None = None
+        self._scan_gallery_D: np.ndarray | None = None
+        self._gui_scan_images: list[Any] = []
+        self._scan_gallery_slots: int = 0
+        if self._show_scan_gallery:
+            tw = int(scan_gallery_thumb_width)
+            # Pinhole only: Lab-3 k3 is huge; projectPoints + polygon fills and
+            # tag warpPerspective assume a projective camera, so distortion here
+            # bends quads into extreme, unrealistic shapes.
+            self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D = _lab3_scaled_pinhole_bundle(
+                tw, use_distortion=False
+            )
+
+        # Full Lab-3 pixel size for ArUco / previews; still pinhole (D=0) for the
+        # same reason as the scan gallery — see comment above.
+        det_w = int(round(2.0 * float(LAB3_CAMERA_K[0, 2])))
+        self._detection_size_wh, self._detection_K, self._detection_D = _lab3_scaled_pinhole_bundle(
+            det_w, use_distortion=False
+        )
 
         with self.server.gui.add_folder("Simulation"):
             self._gui_step_label = self.server.gui.add_text("Last step", "idle", disabled=True)
@@ -587,8 +684,21 @@ class ViserRenderer(SimulationRenderer):
     def _render_camera_view(self, q: np.ndarray) -> None:
         if self._gui_camera_image is None or self._camera_view_K is None:
             return
+        img = self._render_camera_pixels(q, self._camera_view_size, self._camera_view_K, self._camera_view_D)
+        self._gui_camera_image.image = img
 
+    def _render_camera_pixels(
+        self,
+        q: np.ndarray,
+        size_wh: tuple[int, int],
+        K: np.ndarray,
+        D: np.ndarray,
+    ) -> np.ndarray:
+        """Simulated on-arm image (``H×W×3`` ``uint8``) for joint vector ``q``."""
         import cv2
+
+        q = np.asarray(q, dtype=float).reshape(6)
+        W, H = int(size_wh[0]), int(size_wh[1])
 
         T_base_cam = self.kin.fk_to_frame(q, 5) @ self.T5c
         T_cam_base = np.linalg.inv(T_base_cam)
@@ -596,13 +706,9 @@ class ViserRenderer(SimulationRenderer):
         t_cw = T_cam_base[:3, 3]
         rvec, _ = cv2.Rodrigues(R_cw)
         tvec = t_cw.reshape(3, 1)
-        K = self._camera_view_K
-        D = self._camera_view_D
-        W, H = self._camera_view_size
 
         img = np.full((H, W, 3), 40, dtype=np.uint8)
 
-        # Collect drawable items with their world poses + depth key.
         drawables: list[tuple[float, str, dict[str, Any], np.ndarray]] = []
         for prim in self._primitives:
             T_world = self._primitive_world_pose(prim)
@@ -613,7 +719,6 @@ class ViserRenderer(SimulationRenderer):
                 continue
             drawables.append((float(origin_cam[2]), prim["kind"], prim, T_world))
 
-        # Painter's algorithm: far objects first.
         drawables.sort(key=lambda x: -x[0])
 
         for _z, kind, prim, T_world in drawables:
@@ -625,7 +730,116 @@ class ViserRenderer(SimulationRenderer):
             except Exception:
                 continue
 
-        self._gui_camera_image.image = img
+        return img
+
+    def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
+        """Lab-3 detector resolution, pinhole projection, **BGR** (OpenCV order)."""
+        import cv2
+
+        rgb = self._render_camera_pixels(
+            q, self._detection_size_wh, self._detection_K, self._detection_D
+        )
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    def clear_scan_pose_estimates(self) -> None:
+        for name in self._scan_pose_names:
+            try:
+                self.server.scene.remove_by_name(name)
+            except Exception:
+                pass
+        self._scan_pose_names.clear()
+
+    def add_scan_pose_estimate(self, name: str, T: np.ndarray) -> None:
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:120]
+        path = f"/scan_pose_est/{safe}"
+        try:
+            self.server.scene.remove_by_name(path)
+        except Exception:
+            pass
+        Tm = np.asarray(T, dtype=float)
+        fr = self.server.scene.add_frame(
+            path,
+            axes_length=0.038,
+            axes_radius=0.0025,
+            origin_radius=0.006,
+        )
+        fr.wxyz = tuple(float(v) for v in R_to_wxyz(Tm[:3, :3]))
+        fr.position = tuple(float(v) for v in Tm[:3, 3])
+        self._scan_pose_names.append(path)
+
+    def on_demo_checkpoint(self) -> None:
+        if not self._demo_interactive:
+            return
+        while self._sim_paused:
+            time.sleep(0.05)
+        if self._sim_abort_requested:
+            self._sim_abort_requested = False
+            raise DemoAbort()
+
+    def wait_for_sim_demo_start(self) -> None:
+        if not self._demo_interactive:
+            return
+        self._sim_start_event.wait()
+        self._sim_start_event.clear()
+
+    def enable_interactive_sim_demo(self, task: Any) -> None:
+        self._demo_interactive = True
+        wtask = weakref.ref(task)
+
+        def _set_status(msg: str) -> None:
+            if self._gui_demo_status is not None:
+                self._gui_demo_status.value = msg
+
+        with self.server.gui.add_folder("Lab 3 sim demo"):
+            self._gui_demo_status = self.server.gui.add_text("Status", "Use Randomize, then Start", disabled=True)
+            self._btn_randomize = self.server.gui.add_button("Randomize layout")
+
+            def _on_randomize(_):
+                t = wtask()
+                if t is None:
+                    return
+                t.randomize_sim_layout()
+                _set_status("Layout updated. Click Start when ready.")
+
+            self._btn_randomize.on_click(_on_randomize)
+
+            self._btn_start = self.server.gui.add_button("Start", color=(80, 160, 90))
+
+            def _on_start(_):
+                self._sim_start_event.set()
+                _set_status("Running…")
+
+            self._btn_start.on_click(_on_start)
+
+            self._btn_pause = self.server.gui.add_button("Pause")
+
+            def _on_pause(_):
+                self._sim_paused = True
+                _set_status("Paused")
+
+            self._btn_pause.on_click(_on_pause)
+
+            self._btn_resume = self.server.gui.add_button("Resume")
+
+            def _on_resume(_):
+                self._sim_paused = False
+                _set_status("Running…")
+
+            self._btn_resume.on_click(_on_resume)
+
+            self._btn_restart = self.server.gui.add_button("Restart demo", color=(200, 120, 60))
+
+            def _on_restart(_):
+                self._sim_abort_requested = True
+                self._sim_paused = False
+                _set_status("Restart requested…")
+
+            self._btn_restart.on_click(_on_restart)
+
+        t0 = wtask()
+        if t0 is not None:
+            t0.randomize_sim_layout()
+            _set_status("Randomized once. Use Randomize / Start.")
 
     def _project(self, points_world: np.ndarray, rvec, tvec, K, D) -> np.ndarray:
         import cv2
@@ -828,6 +1042,19 @@ class ViserRenderer(SimulationRenderer):
         )
         return name
 
+    def clear_hanoi_scene_objects(self) -> None:
+        self._attached.clear()
+        self._object_local.clear()
+        for path in sorted(self._object_handles.keys(), key=lambda p: (-p.count("/"), -len(p))):
+            try:
+                self.server.scene.remove_by_name(path)
+            except Exception:
+                pass
+        self._object_handles.clear()
+        self._world_poses.clear()
+        self._primitives.clear()
+        self._object_counter = 0
+
     def set_object_pose(self, handle: str, T: np.ndarray) -> None:
         if handle not in self._object_handles:
             return
@@ -907,6 +1134,122 @@ class ViserRenderer(SimulationRenderer):
                 continue
             T_world = T_tool @ T_local
             self.set_object_pose(handle, T_world)
+
+    def set_camera_scan_path(self, points_xyz: np.ndarray | None, *, visible: bool = True) -> None:
+        for name in self._scan_path_names:
+            try:
+                self.server.scene.remove_by_name(name)
+            except Exception:
+                pass
+        self._scan_path_names.clear()
+        if not self._show_camera_scan_path or points_xyz is None or not visible:
+            return
+        pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            return
+        rgb = np.array([220, 120, 40], dtype=np.uint8)
+        n_seg = pts.shape[0] - 1
+        segs = np.stack([pts[:-1], pts[1:]], axis=1)
+        colors = np.broadcast_to(rgb, (n_seg, 2, 3)).copy()
+        line_name = "/scan_path/loop"
+        self.server.scene.add_line_segments(
+            line_name,
+            points=segs,
+            colors=colors,
+            line_width=3.0,
+        )
+        self._scan_path_names.append(line_name)
+        for i, row in enumerate(pts):
+            sph = f"/scan_path/p_{i}"
+            self.server.scene.add_icosphere(
+                sph,
+                radius=0.014,
+                color=(220, 120, 40),
+                subdivisions=2,
+                position=tuple(float(v) for v in row),
+            )
+            self._scan_path_names.append(sph)
+
+    def set_tag_workspace_outline(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        *,
+        z_table: float = 0.002,
+        visible: bool = True,
+    ) -> None:
+        for name in self._workspace_outline_names:
+            try:
+                self.server.scene.remove_by_name(name)
+            except Exception:
+                pass
+        self._workspace_outline_names.clear()
+        if not self._show_tag_workspace_outline or not visible:
+            return
+        z = float(z_table)
+        xa, xb = float(x_min), float(x_max)
+        ya, yb = float(y_min), float(y_max)
+        corners = np.array(
+            [
+                [xa, ya, z],
+                [xb, ya, z],
+                [xb, yb, z],
+                [xa, yb, z],
+                [xa, ya, z],
+            ],
+            dtype=np.float32,
+        )
+        segs = np.stack([corners[:-1], corners[1:]], axis=1)
+        rgb = np.array([90, 200, 120], dtype=np.uint8)
+        colors = np.broadcast_to(rgb, (segs.shape[0], 2, 3)).copy()
+        name = "/lab3_workspace/outline"
+        self.server.scene.add_line_segments(
+            name,
+            points=segs,
+            colors=colors,
+            line_width=2.5,
+        )
+        self._workspace_outline_names.append(name)
+
+    def on_scan_snapshot(
+        self,
+        index: int,
+        *,
+        total: int,
+        q: np.ndarray | None = None,
+        frame_bgr: np.ndarray | None = None,
+    ) -> None:
+        if not self._show_scan_gallery or self._scan_gallery_K is None:
+            return
+        import cv2
+
+        if total <= 0 or index < 0 or index >= total:
+            return
+
+        if self._scan_gallery_slots != total:
+            self._gui_scan_images.clear()
+            with self.server.gui.add_folder("Scan views"):
+                wg, hg = self._scan_gallery_size
+                for i in range(total):
+                    blank = np.full((hg, wg, 3), 48, dtype=np.uint8)
+                    self._gui_scan_images.append(
+                        self.server.gui.add_image(blank, label=f"Scan {i + 1} / {total}")
+                    )
+            self._scan_gallery_slots = total
+
+        wg, hg = self._scan_gallery_size
+        if frame_bgr is not None:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(rgb, (wg, hg), interpolation=cv2.INTER_AREA)
+        else:
+            q_use = self._current_q if q is None else np.asarray(q, dtype=float).reshape(6)
+            img = self._render_camera_pixels(
+                q_use, self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D
+            )
+
+        self._gui_scan_images[index].image = img
 
     def trail_point(self, p_world: np.ndarray, *, pen_down: bool) -> None:
         p = np.asarray(p_world, dtype=float).reshape(3)
