@@ -41,7 +41,14 @@ from typing_extensions import Annotated
 from .detector import ArucoDetector
 from .kinematics import UR10e
 from .robot import RobotController
-from .sim import DemoAbort, NullRenderer, SimulationRenderer, ViserRenderer
+from .sim import (
+    DemoAbort,
+    LAB3_CAMERA_IMAGE_H,
+    LAB3_CAMERA_IMAGE_W,
+    NullRenderer,
+    SimulationRenderer,
+    ViserRenderer,
+)
 from .transforms import fuse_rigid_transforms, make_T, make_T_rpy
 
 
@@ -74,6 +81,10 @@ PAD_COLORS: dict[PadTag, tuple[int, int, int]] = {
     PadTag.MIDDLE_PAD: (220, 180, 130),
     PadTag.END_PAD: (170, 220, 180),
 }
+
+# Thin pad slab in :meth:`HanoiTask.populate_scene` (must match :meth:`pad_center_from_marker_pose`).
+PAD_SLAB_THICKNESS_M: float = 0.004
+PAD_SLAB_CENTER_Z_M: float = -0.002
 
 ALL_HANOI_TAGS: tuple[BoxTag | PadTag, ...] = tuple(BoxTag) + tuple(PadTag)
 
@@ -134,6 +145,30 @@ class HanoiDetector(ArucoDetector):
 
     block_thickness: float = 0.05  # per PDF Part 2 prep (a)
     pad_size: float = 0.20  # per PDF Part 3 prep (b)
+
+    def pad_center_from_marker_pose(self, T_base_marker: np.ndarray) -> np.ndarray:
+        """Pad geometric center in base frame from a pad marker :math:`4\\times4` pose.
+
+        ``solvePnP`` / :meth:`find_tag_poses` put the marker origin at the **marker
+        center**. For a flat pad with the tag in the bottom-left, the pad center is
+        offset by ``(pad_size - marker_length)/2`` in **world +x and +y** (same
+        convention as :meth:`HanoiTask.populate_scene`, which parents tags under an
+        **axis-aligned** pad box).
+
+        We intentionally **do not** apply that offset using the measured marker
+        rotation ``R``: a few degrees (or a near-π yaw ambiguity) would swing the
+        ~9 cm in-plane offset and place pad centers **O(10–20 cm)** away from the
+        mesh, while the Viser pad/tag geometry still uses identity pad rotation.
+        """
+        T = np.asarray(T_base_marker, dtype=float).reshape(4, 4)
+        p = T[:3, 3].copy()
+        ps = float(self.pad_size)
+        tw = float(self.marker_length)
+        d = (ps - tw) / 2
+        p[0] += d
+        p[1] += d
+        p[2] = float(PAD_SLAB_CENTER_Z_M)
+        return p
 
     def find_tag_poses(
         self,
@@ -208,15 +243,16 @@ class HanoiDetector(ArucoDetector):
         """Base -> gripper-center transform for dropping a block onto the given pad.
 
         The tower is a 20 cm square with its ArUco tag in the bottom-left corner,
-        lying flat at ``z ~ 0`` with base-frame-aligned orientation. We take only
-        the tag's position, offset in the **base** frame by ``(pad_size/2,
-        pad_size/2, block_thickness/2)``, and stamp on a clean downward grasp
-        orientation so the held block ends up resting on the pad.
+        lying flat at ``z ~ 0`` with base-frame-aligned orientation. ``T_base_aruco``
+        is the fused **marker-center** pose from OpenCV. We convert to the pad
+        center, then offset by ``block_thickness/2`` in ``z`` for the place height.
         """
-        aruco_pos = np.asarray(T_base_aruco, dtype=float)[:3, 3]
-        pad_center_xy = aruco_pos + np.array([self.pad_size / 2, self.pad_size / 2, 0.0], dtype=float)
-        # Place so the block rests flat on the pad (gripper center = block center).
-        place_pos = pad_center_xy + np.array([0.0, 0.0, self.block_thickness / 2], dtype=float)
+        pad_c = self.pad_center_from_marker_pose(T_base_aruco)
+        # Block center sits on the table plane (pad top ≈ 0); xy from pad center.
+        place_pos = np.array(
+            [float(pad_c[0]), float(pad_c[1]), self.block_thickness / 2],
+            dtype=float,
+        )
 
         T_place = np.eye(4, dtype=float)
         T_place[:3, :3] = GRASP_ORIENTATION
@@ -333,8 +369,8 @@ def _default_scan_points(scan_height: float = DEFAULT_SCAN_HEIGHT) -> np.ndarray
     #     ],
     #     dtype=float,
     # )
-    y_points = 4
-    x_points = 4
+    y_points = 3
+    x_points = 3
     x_min = -0.5#TAG_WORKSPACE_X_MIN
     x_max = 0.5#TAG_WORKSPACE_X_MAX
     y_min = -0.7#TAG_WORKSPACE_Y_MIN
@@ -728,7 +764,7 @@ class HanoiTask:
         :meth:`_ingest_detections` is not called (caller supplies poses).
 
         If ``synthetic_scan_detection`` is true (Viser path), a synthetic
-        frame is rendered at **640×480** with the renderer's **K** and **D**
+        frame is rendered at lab image size (``LAB3_CAMERA_IMAGE_W`` × ``LAB3_CAMERA_IMAGE_H``) with the renderer's **K** and **D**
         (lab PDF calibration, or ideal pinhole if Viser was built with
         ``sim_camera_intrinsics="simple"``), matching
         :meth:`me235b.sim.ViserRenderer.synthetic_aruco_intrinsics`.
@@ -875,7 +911,7 @@ class HanoiTask:
         """World-frame **fused marker** poses for Viser scan triads.
 
         Each frame is the full fused 4×4 from PnP + :func:`fuse_rigid_transforms`
-        (tag corner on the pad, tag on the block top face). That matches the
+        (marker center on the pad / block). That matches the
         geometry OpenCV reports, so triad origins sit on the actual markers and
         offsets vs meshes are easy to read. Ingest still uses pad centers / stack z
         in :meth:`_ingest_detections`.
@@ -894,8 +930,10 @@ class HanoiTask:
     ) -> None:
         """Populate pad_centers, pad_stacks, and block_centers from a scan.
 
-        Pad center = ArUco corner + (pad_size/2, pad_size/2, 0) in base frame.
-        Each block is assigned to whichever pad center it's closest to in xy.
+        Pad centers come from :meth:`HanoiDetector.pad_center_from_marker_pose`
+        (marker-center detections + axis-aligned pad offset in world ``xy``, slab
+        ``z`` matching :meth:`populate_scene`). Each block is assigned to whichever
+        pad center it's closest to in xy.
 
         Per the PDF, blocks in the starting tower are *corner-stacked* (not centered
         on the pad) so their tags stay visible. We therefore use the ArUco's
@@ -906,11 +944,7 @@ class HanoiTask:
         """
         self.pad_centers.clear()
         for tag, T_aruco in pad_detections.items():
-            p = np.asarray(T_aruco, dtype=float)[:3, 3]
-            self.pad_centers[tag] = p + np.array(
-                [self.detector.pad_size / 2, self.detector.pad_size / 2, 0.0],
-                dtype=float,
-            )
+            self.pad_centers[tag] = self.detector.pad_center_from_marker_pose(T_aruco)
 
         self.pad_stacks = {p: [] for p in PadTag}
         self.block_centers.clear()
@@ -1067,10 +1101,10 @@ class HanoiTask:
 
         for pad, center_xy in self.pad_centers.items():
             T_visual = np.eye(4, dtype=float)
-            T_visual[:3, 3] = [float(center_xy[0]), float(center_xy[1]), -0.002]
+            T_visual[:3, 3] = [float(center_xy[0]), float(center_xy[1]), PAD_SLAB_CENTER_Z_M]
             handle = self.renderer.add_box(
                 T_visual,
-                dimensions=(pad_size, pad_size, 0.004),
+                dimensions=(pad_size, pad_size, PAD_SLAB_THICKNESS_M),
                 label=f"pad_{pad.name.lower()}",
                 color=PAD_COLORS[pad],
             )
@@ -1110,9 +1144,17 @@ class HanoiTask:
         pad_side = float(self.detector.pad_size)
         pad_centers = _sample_non_overlapping_pad_centers(rng, pad_side)
 
-        pad_offset = np.array([self.detector.pad_size / 2, self.detector.pad_size / 2, 0.0], dtype=float)
+        ps = float(self.detector.pad_size)
+        tw = float(self.detector.marker_length)
         R_id = np.eye(3, dtype=float)
-        pads = {tag: make_T(pad_centers[tag] - pad_offset, R_id) for tag in PadTag}
+        pads = {
+            tag: make_T(
+                np.asarray(pad_centers[tag], dtype=float)
+                + np.array([-(ps - tw) / 2, -(ps - tw) / 2, 0.0], dtype=float),
+                R_id,
+            )
+            for tag in PadTag
+        }
 
         bt = self.detector.block_thickness
         tw = self.detector.marker_length
@@ -1173,9 +1215,16 @@ class HanoiTask:
         R_id = np.eye(3, dtype=float)
 
         # Pad ArUco corners (bottom-left corner in each pad's 20 cm square).
-        pad_offset = np.array([self.detector.pad_size / 2, self.detector.pad_size / 2, 0.0], dtype=float)
+        ps = float(self.detector.pad_size)
+        tw = float(self.detector.marker_length)
         pad_centers = {tag: v.copy() for tag, v in DEFAULT_PAD_CENTERS_LAB3.items()}
-        pads = {tag: make_T(center - pad_offset, R_id) for tag, center in pad_centers.items()}
+        pads = {
+            tag: make_T(
+                np.asarray(center, dtype=float) + np.array([-(ps - tw) / 2, -(ps - tw) / 2, 0.0], dtype=float),
+                R_id,
+            )
+            for tag, center in pad_centers.items()
+        }
 
         # Stack all three blocks on START_PAD, largest on bottom. Corner offset
         # between adjacent blocks chosen so the smaller block's tag sits inside
@@ -1453,11 +1502,12 @@ def run_hanoi(
     viser_scan_gallery_width: Annotated[
         int,
         typer.Option(
-            help="Viser 'Scan i/n' gallery image width (pixels); height follows lab calibration "
-            "aspect or 4:3 in simple sim. Default 640 matches 640×480 synthetic / USB frames. "
+            help="Viser 'Scan i/n' gallery image width (pixels); height follows the lab frame aspect "
+            "(``LAB3_CAMERA_IMAGE_W``/``H`` in simple sim, scaled PDF calibration in lab mode). Default "
+            "matches ``LAB3_CAMERA_IMAGE_W`` (2304). "
             "Use a smaller value (e.g. 200) for lighter UI.",
         ),
-    ] = 640,
+    ] = 2304,
     sim_vision_gt_tolerance_m: Annotated[
         float | None,
         typer.Option(
@@ -1503,6 +1553,8 @@ def run_hanoi(
             camera = cv2.VideoCapture(camera_index)
             if not camera.isOpened():
                 raise RuntimeError(f"run_hanoi: cv2.VideoCapture({camera_index}) failed to open.")
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, float(LAB3_CAMERA_IMAGE_W))
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, float(LAB3_CAMERA_IMAGE_H))
 
         planned_scan: np.ndarray | None = None
         if auto_scan_points:

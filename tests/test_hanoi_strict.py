@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from me235b.hanoi import BoxTag, HanoiDetector, HanoiTask, PadTag
+from me235b.hanoi import PAD_SLAB_CENTER_Z_M, BoxTag, HanoiDetector, HanoiTask, PadTag
+from me235b.transforms import make_T
 from me235b.kinematics import UR10e
 from me235b.robot import RobotController
 from me235b.sim import NullRenderer
@@ -45,6 +46,16 @@ def test_sim_vision_gt_tolerance_raises_on_drift() -> None:
     task.pad_centers[PadTag.START_PAD] = np.array([0.01, 0.0, 0.0], dtype=float)
     with pytest.raises(ValueError, match="Sim vision vs Randomize layout"):
         task._raise_if_sim_vision_gt_exceeds_tolerance()
+
+
+def test_pad_center_from_marker_pose_matches_lab_geometry() -> None:
+    """OpenCV uses marker center; pad center is offset by (pad_size - tag)/2 in-plane."""
+    det = HanoiDetector()
+    ps, tw = float(det.pad_size), float(det.marker_length)
+    M = np.array([-(ps - tw) / 2, -(ps - tw) / 2, 0.0], dtype=float)
+    T = make_T(M, np.eye(3, dtype=float))
+    pc = det.pad_center_from_marker_pose(T)
+    assert np.allclose(pc, [0.0, 0.0, PAD_SLAB_CENTER_Z_M], atol=1e-9)
 
 
 def test_sim_vision_gt_tolerance_passes_when_within_tol() -> None:

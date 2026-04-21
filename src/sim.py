@@ -69,9 +69,10 @@ LAB3_CAMERA_D: np.ndarray = np.array(
     dtype=float,
 )
 
-# Typical USB capture resolution for the lab camera (matches hardware frames).
-LAB3_CAMERA_IMAGE_W: int = 640
-LAB3_CAMERA_IMAGE_H: int = 480
+# Lab camera capture resolution (width × height); intrinsics scale via
+# :func:`_lab3_scaled_pinhole_bundle` when this differs from the PDF calibration image size.
+LAB3_CAMERA_IMAGE_W: int = 2304
+LAB3_CAMERA_IMAGE_H: int = 1536
 
 #: Doc link for ``ClientHandle.get_render`` / ``CameraHandle.get_render`` (pinhole
 #: WebGL capture; no OpenCV ``D``). Prefer :meth:`ViserRenderer.synthetic_camera_bgr_for_pose`
@@ -439,7 +440,7 @@ class SimulationRenderer:
         """Record one of ``total`` scan images at pose ``q`` or from a live ``frame_bgr``."""
 
     def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
-        """BGR synthetic camera at hardware resolution (640×480) with lab ``(K, D)``, or ``None``."""
+        """BGR synthetic camera at :data:`LAB3_CAMERA_IMAGE_W`×:data:`LAB3_CAMERA_IMAGE_H` with lab ``(K, D)``, or ``None``."""
 
     def synthetic_aruco_intrinsics(self) -> tuple[np.ndarray, np.ndarray] | None:
         """``(K, D)`` matching :meth:`synthetic_camera_bgr_for_pose` for ``solvePnP``."""
@@ -727,8 +728,11 @@ class ViserRenderer(SimulationRenderer):
         if self._show_scan_gallery:
             tw = max(1, int(scan_gallery_thumb_width))
             if self._use_simple_sim_camera:
+                # Do not use ``_simple_pinhole_bundle((tw, 0))`` here: its default aspect is 4:3,
+                # which would not match lab frame geometry (e.g. 1536-wide → 1152 tall).
+                gh = max(1, int(round(tw * float(LAB3_CAMERA_IMAGE_H) / float(LAB3_CAMERA_IMAGE_W))))
                 self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D = _simple_pinhole_bundle(
-                    (tw, 0)
+                    (tw, gh)
                 )
             else:
                 # Pinhole only: Lab-3 k3 is huge; thumbnails stay fast/readable.
@@ -736,7 +740,7 @@ class ViserRenderer(SimulationRenderer):
                     (tw, 0), use_distortion=False
                 )
 
-        # Synthetic scan / ArUco frames: same pixel size as hardware (640×480).
+        # Synthetic scan / ArUco frames: same pixel size as :data:`LAB3_CAMERA_IMAGE_W`×:data:`LAB3_CAMERA_IMAGE_H`.
         if self._use_simple_sim_camera:
             self._detection_size_wh, self._detection_K, self._detection_D = _simple_pinhole_bundle(
                 (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H)
@@ -881,7 +885,7 @@ class ViserRenderer(SimulationRenderer):
         return img
 
     def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
-        """640×480 synthetic frame with renderer **K** / **D**, **BGR** (OpenCV order).
+        """Synthetic frame at lab image size with renderer **K** / **D**, **BGR** (OpenCV order).
 
         Intrinsics match :meth:`synthetic_aruco_intrinsics` (lab PDF or
         ``sim_camera_intrinsics="simple"``).
@@ -899,7 +903,7 @@ class ViserRenderer(SimulationRenderer):
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     def synthetic_aruco_intrinsics(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """``(K, D)`` matching :meth:`synthetic_camera_bgr_for_pose` (640×480 bundle)."""
+        """``(K, D)`` matching :meth:`synthetic_camera_bgr_for_pose` (scaled lab bundle)."""
         K = self._detection_K.copy()
         D = self._detection_D.copy()
         if self._use_simple_sim_camera:

@@ -19,7 +19,7 @@ from me235b.sim import (
 )
 
 
-def test_lab3_synthetic_resolution_matches_hardware() -> None:
+def test_lab3_synthetic_resolution_matches_lab_constants() -> None:
     wh, _, _ = _lab3_scaled_pinhole_bundle(
         (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H), use_distortion=True
     )
@@ -42,7 +42,7 @@ def test_lab3_bundle_derives_height_from_width() -> None:
     assert H == int(round(400 * native_h / native_w))
 
 
-def test_simple_bundle_matches_vga_and_zero_distortion() -> None:
+def test_simple_bundle_matches_lab_image_defaults_and_zero_distortion() -> None:
     wh, K, D = _simple_pinhole_bundle((LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H))
     assert wh == (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H)
     assert np.allclose(D, 0.0)
