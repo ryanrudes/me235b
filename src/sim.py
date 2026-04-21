@@ -69,22 +69,101 @@ LAB3_CAMERA_D: np.ndarray = np.array(
     dtype=float,
 )
 
+# Typical USB capture resolution for the lab camera (matches hardware frames).
+LAB3_CAMERA_IMAGE_W: int = 640
+LAB3_CAMERA_IMAGE_H: int = 480
+
+#: Doc link for ``ClientHandle.get_render`` / ``CameraHandle.get_render`` (pinhole
+#: WebGL capture; no OpenCV ``D``). Prefer :meth:`ViserRenderer.synthetic_camera_bgr_for_pose`
+#: for lab distortion on rasterized primitives.
+VISER_GET_RENDER_DOC: str = "https://viser.studio/main/examples/interaction/get_renders/"
+
 
 def _lab3_scaled_pinhole_bundle(
-    panel_w: int, *, use_distortion: bool
+    size_wh: tuple[int, int], *, use_distortion: bool
 ) -> tuple[tuple[int, int], np.ndarray, np.ndarray]:
-    """Return ``((W, H), K, D)`` for a Lab-3 style virtual image of width ``panel_w``."""
+    """Return ``((W, H), K, D)`` for a Lab-3 style virtual image.
+
+    ``size_wh`` is ``(width, height)``. If either dimension is ``<= 0``, it is
+    inferred from the other using the native calibration aspect ratio
+    ``(2·cx, 2·cy)``. Intrinsics scale with ``sx = W / native_w`` and
+    ``sy = H / native_h`` so non-native aspects are honored when requested.
+    """
     native_w = float(2 * LAB3_CAMERA_K[0, 2])
     native_h = float(2 * LAB3_CAMERA_K[1, 2])
-    panel_h = int(round(int(panel_w) * native_h / native_w))
-    s = float(panel_w) / native_w
+    W_req, H_req = int(size_wh[0]), int(size_wh[1])
+    if W_req <= 0 and H_req <= 0:
+        W_req = 320
+    if W_req > 0 and H_req <= 0:
+        H = max(1, int(round(W_req * native_h / native_w)))
+        W = W_req
+    elif H_req > 0 and W_req <= 0:
+        W = max(1, int(round(H_req * native_w / native_h)))
+        H = H_req
+    else:
+        W, H = max(1, W_req), max(1, H_req)
+    sx = float(W) / native_w
+    sy = float(H) / native_h
     K = LAB3_CAMERA_K.copy()
-    K[0, 0] *= s
-    K[1, 1] *= s
-    K[0, 2] *= s
-    K[1, 2] *= s
+    K[0, 0] *= sx
+    K[1, 1] *= sy
+    K[0, 2] *= sx
+    K[1, 2] *= sy
     D = LAB3_CAMERA_D.copy() if use_distortion else np.zeros(5, dtype=float)
-    return (int(panel_w), panel_h), K, D
+    return (W, H), K, D
+
+
+def _simple_pinhole_bundle(
+    size_wh: tuple[int, int],
+    *,
+    horizontal_fov_deg: float = 58.0,
+) -> tuple[tuple[int, int], np.ndarray, np.ndarray]:
+    """Return ``((W, H), K, D)`` for an ideal pinhole camera (``D`` all zeros).
+
+    Intended for **simulation-only** synthetic frames so localization can be
+    debugged without the lab distortion model. Hardware runs should still use
+    :func:`_lab3_scaled_pinhole_bundle` / :class:`me235b.detector.ArucoDetector`
+    defaults.
+
+    ``size_wh`` is ``(width, height)``. If one dimension is ``<= 0``, it is
+    inferred from the other using a **4:3** aspect (common VGA shape).
+    Horizontal FOV is the full angle across the image width; ``fx = fy``.
+    """
+    W_req, H_req = int(size_wh[0]), int(size_wh[1])
+    if W_req <= 0 and H_req <= 0:
+        W_req, H_req = LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H
+    if W_req > 0 and H_req <= 0:
+        H = max(1, int(round(W_req * 3.0 / 4.0)))
+        W = W_req
+    elif H_req > 0 and W_req <= 0:
+        W = max(1, int(round(H_req * 4.0 / 3.0)))
+        H = H_req
+    else:
+        W, H = max(1, W_req), max(1, H_req)
+
+    hfov = float(np.deg2rad(horizontal_fov_deg))
+    fx = (0.5 * float(W)) / max(np.tan(0.5 * hfov), 1e-9)
+    fy = fx
+    cx = 0.5 * float(W)
+    cy = 0.5 * float(H)
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=float)
+    D = np.zeros(5, dtype=float)
+    return (W, H), K, D
+
+
+def _K_for_vertically_flipped_image(K: np.ndarray, image_height: int) -> np.ndarray:
+    """Intrinsic matrix after ``rgb[::-1]`` (flip image rows, height ``H``).
+
+    If ``v' = H - 1 - v`` and ``v = fy * Y/Z + cy``, then
+    ``v' = (-fy) * Y/Z + (H - 1 - cy)``. Distortion ``D`` is unchanged for the
+    common ``D[2]=D[3]=0`` tangential-skip case; lab ``D`` with non-zero
+    tangential terms should not use this helper without a fuller model.
+    """
+    H = int(image_height)
+    out = np.asarray(K, dtype=float).copy()
+    out[1, 1] = -float(out[1, 1])
+    out[1, 2] = float(H - 1) - float(out[1, 2])
+    return out
 
 
 # --- ROS-Industrial Robotiq URDF fetcher -------------------------------------
@@ -360,7 +439,10 @@ class SimulationRenderer:
         """Record one of ``total`` scan images at pose ``q`` or from a live ``frame_bgr``."""
 
     def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
-        """BGR pinhole view at lab ``K`` / resolution for ArUco, or ``None``."""
+        """BGR synthetic camera at hardware resolution (640×480) with lab ``(K, D)``, or ``None``."""
+
+    def synthetic_aruco_intrinsics(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """``(K, D)`` matching :meth:`synthetic_camera_bgr_for_pose` for ``solvePnP``."""
 
     def clear_scan_pose_estimates(self) -> None:
         """Remove transient scan-time pose markers from the scene."""
@@ -369,7 +451,7 @@ class SimulationRenderer:
         """Remove pads/boxes/tags added for Hanoi so the scene can be repopulated."""
 
     def add_scan_pose_estimate(self, name: str, T: np.ndarray) -> None:
-        """Draw a small world-frame triad at an estimated tag pose (e.g. during scan)."""
+        """Draw a small world-frame triad at a fused marker pose (4×4 from scan fusion)."""
 
     def on_demo_checkpoint(self) -> None:
         """Interactive Viser demo: honor pause / restart between motions."""
@@ -402,6 +484,14 @@ class ViserRenderer(SimulationRenderer):
     The viewer uses whatever home the URDF ships with; if your classical-DH
     joint zero visually differs from the URDF zero, pass a ``joint_offset``
     that gets added to every ``q_class`` before it's pushed to the URDF.
+
+    Simulated camera pixels use OpenCV ``K`` / ``D`` on scene primitives, not
+    the WebGL pipeline. For an undistorted mesh snapshot of the Viser client,
+    see :data:`VISER_GET_RENDER_DOC` (``get_render`` is pinhole only).
+
+    Pass ``sim_camera_intrinsics="simple"`` for an ideal pinhole (``D=0``) at
+    sim resolutions so synthetic images stay clean; ``"lab"`` (default) uses
+    the PDF calibration for hardware-aligned vision.
     """
 
     def __init__(
@@ -424,9 +514,11 @@ class ViserRenderer(SimulationRenderer):
         show_scan_gallery: bool = True,
         scan_gallery_thumb_width: int = 200,
         show_camera_view: bool = True,
-        camera_view_size: tuple[int, int] = (320, 240),
-        camera_view_distortion: bool = False,
+        camera_view_size: tuple[int, int] = (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H),
+        camera_view_distortion: bool = True,
+        show_camera_frustum: bool = True,
         T5c: np.ndarray | None = None,
+        sim_camera_intrinsics: str = "lab",
     ) -> None:
         try:
             import viser
@@ -445,6 +537,12 @@ class ViserRenderer(SimulationRenderer):
             self.joint_offset = np.asarray(joint_offset, dtype=float).reshape(6)
         self.frame_dt = 1.0 / float(frame_rate)
         self.T5c = T5C_LAB3.copy() if T5c is None else np.asarray(T5c, dtype=float)
+
+        _sim_cam = str(sim_camera_intrinsics).strip().lower()
+        if _sim_cam not in ("lab", "simple"):
+            raise ValueError("sim_camera_intrinsics must be 'lab' or 'simple'")
+        self._sim_camera_intrinsics: str = _sim_cam
+        self._use_simple_sim_camera: bool = _sim_cam == "simple"
 
         self.server = viser.ViserServer(verbose=False)
         try:
@@ -566,44 +664,53 @@ class ViserRenderer(SimulationRenderer):
             self._update_gripper_pose(self._current_q)
             self.on_gripper("open")
 
-        # Arm-mounted camera body: a dark cuboid parented to a frame that
-        # tracks frame 5, with the body offset by the T5c origin so the visual
-        # sits exactly where the physical camera is bolted on. We add a small
-        # lens cylinder-ish cuboid too for visual clarity.
+        # Arm-mounted camera: frame tracks link 5; optional body meshes and/or
+        # OpenCV-aligned frustum for debugging.
         self._camera_arm_frame: Any | None = None
-        if show_arm_camera:
+        self._camera_frustum_handle: Any | None = None
+        need_cam_mount = bool(show_arm_camera or show_camera_frustum)
+        if need_cam_mount:
             self._camera_arm_frame = self.server.scene.add_frame(
                 "/camera_mount", show_axes=False
             )
-            camera_body_pos = tuple(float(v) for v in self.T5c[:3, 3])
-            self.server.scene.add_box(
-                "/camera_mount/body",
-                dimensions=(0.04, 0.025, 0.030),
-                color=(25, 25, 30),
-                wxyz=R_to_wxyz(self.T5c[:3, :3]),
-                position=camera_body_pos,
-            )
-            lens_offset = np.asarray(self.T5c[:3, 3], dtype=float) + self.T5c[:3, :3] @ np.array([0.0, 0.0, 0.018])
-            self.server.scene.add_box(
-                "/camera_mount/lens",
-                dimensions=(0.016, 0.016, 0.008),
-                color=(70, 70, 90),
-                wxyz=R_to_wxyz(self.T5c[:3, :3]),
-                position=tuple(float(v) for v in lens_offset),
-            )
+            if show_arm_camera:
+                camera_body_pos = tuple(float(v) for v in self.T5c[:3, 3])
+                self.server.scene.add_box(
+                    "/camera_mount/body",
+                    dimensions=(0.04, 0.025, 0.030),
+                    color=(25, 25, 30),
+                    wxyz=R_to_wxyz(self.T5c[:3, :3]),
+                    position=camera_body_pos,
+                )
+                lens_offset = np.asarray(self.T5c[:3, 3], dtype=float) + self.T5c[:3, :3] @ np.array(
+                    [0.0, 0.0, 0.018]
+                )
+                self.server.scene.add_box(
+                    "/camera_mount/lens",
+                    dimensions=(0.016, 0.016, 0.008),
+                    color=(70, 70, 90),
+                    wxyz=R_to_wxyz(self.T5c[:3, :3]),
+                    position=tuple(float(v) for v in lens_offset),
+                )
             self._update_camera_mount_pose(self._current_q)
 
-        # Live camera panel + per-scan thumbnails share the same Lab-3 intrinsics
-        # scaling; gallery can exist without the main floating preview.
+        # Live camera panel + per-scan thumbnails share Lab-3 intrinsics scaling.
         self._camera_view_size: tuple[int, int] = (0, 0)
         self._camera_view_K: np.ndarray | None = None
         self._camera_view_D: np.ndarray | None = None
         self._gui_camera_image: Any | None = None
         if show_camera_view:
-            pw = int(camera_view_size[0])
-            self._camera_view_size, self._camera_view_K, self._camera_view_D = _lab3_scaled_pinhole_bundle(
-                pw, use_distortion=camera_view_distortion
-            )
+            cw = max(1, int(camera_view_size[0]))
+            ch = int(camera_view_size[1])
+            if self._use_simple_sim_camera:
+                # Ignore camera_view_distortion: simple mode is always D=0.
+                self._camera_view_size, self._camera_view_K, self._camera_view_D = _simple_pinhole_bundle(
+                    (cw, ch)
+                )
+            else:
+                self._camera_view_size, self._camera_view_K, self._camera_view_D = _lab3_scaled_pinhole_bundle(
+                    (cw, ch), use_distortion=camera_view_distortion
+                )
             w, h = self._camera_view_size
             placeholder = np.full((h, w, 3), 60, dtype=np.uint8)
             self._gui_camera_image = self.server.gui.add_image(
@@ -618,20 +725,56 @@ class ViserRenderer(SimulationRenderer):
         self._gui_scan_images: list[Any] = []
         self._scan_gallery_slots: int = 0
         if self._show_scan_gallery:
-            tw = int(scan_gallery_thumb_width)
-            # Pinhole only: Lab-3 k3 is huge; projectPoints + polygon fills and
-            # tag warpPerspective assume a projective camera, so distortion here
-            # bends quads into extreme, unrealistic shapes.
-            self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D = _lab3_scaled_pinhole_bundle(
-                tw, use_distortion=False
+            tw = max(1, int(scan_gallery_thumb_width))
+            if self._use_simple_sim_camera:
+                self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D = _simple_pinhole_bundle(
+                    (tw, 0)
+                )
+            else:
+                # Pinhole only: Lab-3 k3 is huge; thumbnails stay fast/readable.
+                self._scan_gallery_size, self._scan_gallery_K, self._scan_gallery_D = _lab3_scaled_pinhole_bundle(
+                    (tw, 0), use_distortion=False
+                )
+
+        # Synthetic scan / ArUco frames: same pixel size as hardware (640×480).
+        if self._use_simple_sim_camera:
+            self._detection_size_wh, self._detection_K, self._detection_D = _simple_pinhole_bundle(
+                (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H)
+            )
+        else:
+            self._detection_size_wh, self._detection_K, self._detection_D = _lab3_scaled_pinhole_bundle(
+                (LAB3_CAMERA_IMAGE_W, LAB3_CAMERA_IMAGE_H), use_distortion=True
             )
 
-        # Full Lab-3 pixel size for ArUco / previews; still pinhole (D=0) for the
-        # same reason as the scan gallery — see comment above.
-        det_w = int(round(2.0 * float(LAB3_CAMERA_K[0, 2])))
-        self._detection_size_wh, self._detection_K, self._detection_D = _lab3_scaled_pinhole_bundle(
-            det_w, use_distortion=False
-        )
+        if show_camera_frustum and self._camera_arm_frame is not None:
+            self.server.scene.add_frame(
+                "/camera_mount/opencv",
+                show_axes=False,
+                wxyz=R_to_wxyz(self.T5c[:3, :3]),
+                position=tuple(float(v) for v in self.T5c[:3, 3]),
+            )
+            if show_camera_view and self._camera_view_K is not None:
+                fw, fh = self._camera_view_size
+                fK = self._camera_view_K
+            else:
+                fw, fh = self._detection_size_wh
+                fK = self._detection_K
+            fy = float(fK[1, 1])
+            fov_y = float(2.0 * np.arctan(float(fh) / (2.0 * max(fy, 1e-6))))
+            aspect = float(fw) / float(fh)
+            fr_img = None
+            if show_camera_view and self._gui_camera_image is not None:
+                fr_img = np.full((fh, fw, 3), 45, dtype=np.uint8)
+            self._camera_frustum_handle = self.server.scene.add_camera_frustum(
+                "/camera_mount/opencv/frustum",
+                fov_y,
+                aspect,
+                scale=0.12,
+                line_width=1.0,
+                color=(120, 180, 255),
+                image=fr_img,
+                variant="filled",
+            )
 
         with self.server.gui.add_folder("Simulation"):
             self._gui_step_label = self.server.gui.add_text("Last step", "idle", disabled=True)
@@ -686,6 +829,11 @@ class ViserRenderer(SimulationRenderer):
             return
         img = self._render_camera_pixels(q, self._camera_view_size, self._camera_view_K, self._camera_view_D)
         self._gui_camera_image.image = img
+        if self._camera_frustum_handle is not None:
+            try:
+                self._camera_frustum_handle.image = img
+            except Exception:
+                pass
 
     def _render_camera_pixels(
         self,
@@ -733,13 +881,31 @@ class ViserRenderer(SimulationRenderer):
         return img
 
     def synthetic_camera_bgr_for_pose(self, q: np.ndarray) -> np.ndarray | None:
-        """Lab-3 detector resolution, pinhole projection, **BGR** (OpenCV order)."""
+        """640×480 synthetic frame with renderer **K** / **D**, **BGR** (OpenCV order).
+
+        Intrinsics match :meth:`synthetic_aruco_intrinsics` (lab PDF or
+        ``sim_camera_intrinsics="simple"``).
+        """
         import cv2
 
         rgb = self._render_camera_pixels(
             q, self._detection_size_wh, self._detection_K, self._detection_D
         )
+        # Simple pinhole sim: FK + ``projectPoints`` image y disagrees with the
+        # row order OpenCV's ArUco decoder expects, so markers decode as bogus IDs
+        # unless we flip rows (see ``synthetic_aruco_intrinsics`` for matching K).
+        if self._use_simple_sim_camera:
+            rgb = np.ascontiguousarray(rgb[::-1])
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    def synthetic_aruco_intrinsics(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """``(K, D)`` matching :meth:`synthetic_camera_bgr_for_pose` (640×480 bundle)."""
+        K = self._detection_K.copy()
+        D = self._detection_D.copy()
+        if self._use_simple_sim_camera:
+            H = int(self._detection_size_wh[1])
+            K = _K_for_vertically_flipped_image(K, H)
+        return (K, D)
 
     def clear_scan_pose_estimates(self) -> None:
         for name in self._scan_pose_names:
@@ -847,6 +1013,157 @@ class ViserRenderer(SimulationRenderer):
         img_pts, _ = cv2.projectPoints(points_world.astype(np.float64), rvec, tvec, K, D)
         return img_pts.reshape(-1, 2)
 
+    @staticmethod
+    def _bilinear_quad_3d(
+        p0: np.ndarray,
+        p1: np.ndarray,
+        p2: np.ndarray,
+        p3: np.ndarray,
+        u: float,
+        v: float,
+    ) -> np.ndarray:
+        """Point on a planar quad: ``p0`` ``(u,v)=(0,0)``, ``p1`` ``(1,0)``, ``p2`` ``(1,1)``, ``p3`` ``(0,1)``."""
+        p0 = np.asarray(p0, dtype=float).reshape(3)
+        p1 = np.asarray(p1, dtype=float).reshape(3)
+        p2 = np.asarray(p2, dtype=float).reshape(3)
+        p3 = np.asarray(p3, dtype=float).reshape(3)
+        uu, vv = float(u), float(v)
+        return (1.0 - uu) * (1.0 - vv) * p0 + uu * (1.0 - vv) * p1 + uu * vv * p2 + (1.0 - uu) * vv * p3
+
+    @staticmethod
+    def _tessellation_gs_from_img_quad(
+        quad_img: np.ndarray,
+        *,
+        lo: int,
+        hi: int,
+        px_per_cell: float,
+    ) -> int:
+        """How many segments per axis to approximate a projected quad under distortion."""
+        q = np.asarray(quad_img, dtype=float).reshape(4, 2)
+        dx = float(np.max(q[:, 0]) - np.min(q[:, 0]))
+        dy = float(np.max(q[:, 1]) - np.min(q[:, 1]))
+        diag = float(np.hypot(dx, dy))
+        if diag < 1e-6:
+            return lo
+        return int(np.clip(max(lo, round(diag / px_per_cell)), lo, hi))
+
+    @staticmethod
+    def _sample_tag_rgb_bilinear(tag_img: np.ndarray, u: float, v: float) -> tuple[int, int, int]:
+        """``(u,v)`` in ``[0,1]²`` maps to tag bitmap; returns ``(R,G,B)`` for ``img`` channels."""
+        Hs, Ws = int(tag_img.shape[0]), int(tag_img.shape[1])
+        if Ws <= 1 or Hs <= 1:
+            c = int(tag_img.reshape(-1)[0])
+            return (c, c, c)
+        uf = float(np.clip(u, 0.0, 1.0)) * float(Ws - 1)
+        vf = float(np.clip(v, 0.0, 1.0)) * float(Hs - 1)
+        x0 = int(np.floor(uf))
+        y0 = int(np.floor(vf))
+        x1 = min(x0 + 1, Ws - 1)
+        y1 = min(y0 + 1, Hs - 1)
+        a = uf - float(x0)
+        b = vf - float(y0)
+        c00 = tag_img[y0, x0].astype(np.float64)
+        c10 = tag_img[y0, x1].astype(np.float64)
+        c01 = tag_img[y1, x0].astype(np.float64)
+        c11 = tag_img[y1, x1].astype(np.float64)
+        c = (1.0 - a) * (1.0 - b) * c00 + a * (1.0 - b) * c10 + (1.0 - a) * b * c01 + a * b * c11
+        return tuple(int(x) for x in np.clip(np.round(c), 0, 255))
+
+    def _paint_world_quadrilateral(
+        self,
+        img: np.ndarray,
+        corners_w: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+        R_cw: np.ndarray,
+        t_cw: np.ndarray,
+        color: tuple[int, int, int],
+    ) -> bool:
+        """Project one world-space quadrilateral and fill it. Returns whether drawn.
+
+        OpenCV ``fillConvexPoly`` requires **int32** vertices (``CV_32S``); float
+        coordinates raise on recent builds and were being skipped by the
+        renderer's broad ``except`` around primitive draws.
+        """
+        import cv2
+
+        cw = np.asarray(corners_w, dtype=float).reshape(4, 3)
+        t_flat = np.asarray(t_cw, dtype=float).reshape(3)
+        z_cam = (R_cw @ cw.T).T[:, 2] + t_flat[2]
+        if np.any(z_cam <= 0.01):
+            return False
+        pts = self._project(cw, rvec, tvec, K, D)
+        if not np.all(np.isfinite(pts)):
+            return False
+        pts_i = np.round(np.clip(pts, -32000.0, 32000.0)).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillConvexPoly(img, pts_i, color, lineType=cv2.LINE_8)
+        return True
+
+    def _fill_world_quad_tessellated(
+        self,
+        img: np.ndarray,
+        p0: np.ndarray,
+        p1: np.ndarray,
+        p2: np.ndarray,
+        p3: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+        R_cw: np.ndarray,
+        t_cw: np.ndarray,
+        gs: int,
+        *,
+        flat_rgb: tuple[int, int, int] | None = None,
+        lambertian_rgb: tuple[np.ndarray, np.ndarray, tuple[int, int, int]] | None = None,
+    ) -> None:
+        """Fill a planar world quad by projecting an ``gs×gs`` grid through ``K,D``.
+
+        Either ``flat_rgb`` (constant fill) or ``lambertian_rgb`` =
+        ``(face_normal, cam_origin_world, (r,g,b))`` for simple view-dependent
+        shading per sub-cell.
+        """
+        for i in range(gs):
+            u0, u1 = i / gs, (i + 1) / gs
+            for j in range(gs):
+                v0, v1 = j / gs, (j + 1) / gs
+                w00 = self._bilinear_quad_3d(p0, p1, p2, p3, u0, v0)
+                w10 = self._bilinear_quad_3d(p0, p1, p2, p3, u1, v0)
+                w11 = self._bilinear_quad_3d(p0, p1, p2, p3, u1, v1)
+                w01 = self._bilinear_quad_3d(p0, p1, p2, p3, u0, v1)
+                corners_w = np.stack([w00, w10, w11, w01], axis=0)
+                if lambertian_rgb is not None:
+                    nrm, cam_o, base = lambertian_rgb
+                    uc, vc = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+                    wc = self._bilinear_quad_3d(p0, p1, p2, p3, uc, vc)
+                    vdir = cam_o - wc
+                    vn = float(np.linalg.norm(vdir))
+                    vdir = vdir / max(vn, 1e-6)
+                    br = 0.6 + 0.4 * max(0.0, float(np.dot(nrm, vdir)))
+                    rr, gg, bb = base
+                    color = (
+                        int(np.clip(rr * br, 0, 255)),
+                        int(np.clip(gg * br, 0, 255)),
+                        int(np.clip(bb * br, 0, 255)),
+                    )
+                elif flat_rgb is not None:
+                    color = flat_rgb
+                else:
+                    continue
+                self._paint_world_quadrilateral(
+                    img,
+                    corners_w,
+                    rvec,
+                    tvec,
+                    K,
+                    D,
+                    R_cw,
+                    t_cw,
+                    color,
+                )
+
     def _draw_box_primitive(
         self,
         img: np.ndarray,
@@ -874,8 +1191,9 @@ class ViserRenderer(SimulationRenderer):
 
         # Skip rendering if any corner is behind the camera (projectPoints returns
         # NaN/absurd values in that case and the integer cast blows up).
-        R_cw_full = cv2.Rodrigues(rvec)[0]
-        corners_cam_z = (R_cw_full @ world_corners.T).T[:, 2] + tvec.reshape(3)[2]
+        R_cw = cv2.Rodrigues(rvec)[0]
+        t_flat = np.asarray(tvec, dtype=float).reshape(3)
+        corners_cam_z = (R_cw @ world_corners.T).T[:, 2] + t_flat[2]
         if np.any(corners_cam_z <= 0.01):
             return
         corners_2d = self._project(world_corners, rvec, tvec, K, D)
@@ -892,8 +1210,7 @@ class ViserRenderer(SimulationRenderer):
             (0, 4, 7, 3),  # -x
         ]
 
-        R_cw = cv2.Rodrigues(rvec)[0]
-        cam_origin_world = -R_cw.T @ tvec.reshape(3)
+        cam_origin_world = -R_cw.T @ t_flat
 
         # Sort faces by depth descending (paint far first).
         def face_depth(f):
@@ -903,7 +1220,7 @@ class ViserRenderer(SimulationRenderer):
         for face in sorted(faces, key=face_depth):
             centroid = world_corners[list(face)].mean(axis=0)
             # Face normal in world = cross of (p1-p0) x (p3-p0) (approx, CCW order).
-            p0, p1, p2, p3 = [world_corners[i] for i in face]
+            p0, p1, p2, p3 = (world_corners[int(i)] for i in face)
             normal = np.cross(p1 - p0, p3 - p0)
             n = np.linalg.norm(normal)
             if n > 1e-9:
@@ -918,22 +1235,48 @@ class ViserRenderer(SimulationRenderer):
             if not np.all(np.isfinite(face_pts)):
                 continue
             face_pts = np.clip(face_pts, -32000, 32000)
-            pts = face_pts.astype(np.int32)
-            # Very lambertian-ish shading: darken faces whose normal is nearly parallel to view.
-            if n > 1e-9:
-                view_dir = (cam_origin_world - centroid) / max(np.linalg.norm(cam_origin_world - centroid), 1e-6)
-                brightness = 0.6 + 0.4 * float(max(0.0, np.dot(normal, view_dir)))
-            else:
-                brightness = 1.0
-            # viser GUI images are RGB; our prim["color"] is (r, g, b) so we
-            # write the triple in RGB order. (Earlier code had a B/R swap bug.)
-            fill = (
-                int(np.clip(r * brightness, 0, 255)),
-                int(np.clip(g * brightness, 0, 255)),
-                int(np.clip(b * brightness, 0, 255)),
+            outline = face_pts.astype(np.float32).reshape(-1, 1, 2)
+
+            gs = self._tessellation_gs_from_img_quad(
+                face_pts,
+                lo=4,
+                hi=18,
+                px_per_cell=11.0,
             )
-            cv2.fillConvexPoly(img, pts, fill)
-            cv2.polylines(img, [pts], True, (10, 10, 10), 1, cv2.LINE_AA)
+            if n > 1e-9:
+                self._fill_world_quad_tessellated(
+                    img,
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    rvec,
+                    tvec,
+                    K,
+                    D,
+                    R_cw,
+                    tvec,
+                    gs,
+                    lambertian_rgb=(normal, cam_origin_world, (r, g, b)),
+                )
+            else:
+                self._fill_world_quad_tessellated(
+                    img,
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    rvec,
+                    tvec,
+                    K,
+                    D,
+                    R_cw,
+                    tvec,
+                    gs,
+                    flat_rgb=(r, g, b),
+                )
+            # viser GUI images are RGB; our prim["color"] is (r, g, b).
+            cv2.polylines(img, [outline], True, (10, 10, 10), 1, cv2.LINE_AA)
 
     def _draw_tag_primitive(
         self,
@@ -954,30 +1297,89 @@ class ViserRenderer(SimulationRenderer):
             dtype=float,
         )
         world_corners = (T_world[:3, :3] @ local_corners.T).T + T_world[:3, 3]
+        R_cw = cv2.Rodrigues(rvec)[0]
+        t_flat = np.asarray(tvec, dtype=float).reshape(3)
+        corners_cam_z = (R_cw @ world_corners.T).T[:, 2] + t_flat[2]
+        if np.any(corners_cam_z <= 0.01):
+            return
         corners_2d = self._project(world_corners, rvec, tvec, K, D).astype(np.float32)
         if not np.all(np.isfinite(corners_2d)):
             return
 
         tag_img = prim["image"]
-        Hs = tag_img.shape[0]
-        Ws = tag_img.shape[1]
-        src = np.array(
-            [[0, 0], [Ws - 1, 0], [Ws - 1, Hs - 1], [0, Hs - 1]],
-            dtype=np.float32,
-        )
-        try:
-            M = cv2.getPerspectiveTransform(src, corners_2d)
-        except cv2.error:
+        Hs, Ws = int(tag_img.shape[0]), int(tag_img.shape[1])
+        if Ws < 2 or Hs < 2:
             return
 
-        H_img, W_img = img.shape[:2]
-        warped = cv2.warpPerspective(tag_img, M, (W_img, H_img))
-        # Use the warped image where it's non-zero (tag pixels).
-        mask = cv2.warpPerspective(
-            np.full((Hs, Ws), 255, dtype=np.uint8), M, (W_img, H_img)
+        # Pinhole (D≈0): exact perspective warp of the marker bitmap. The legacy
+        # tessellation path assigns one flat color per cell, which aliases the
+        # high-frequency ArUco grid and breaks ``detectMarkers`` on many views.
+        Df = np.asarray(D, dtype=float).reshape(-1)
+        if np.all(np.abs(Df) < 1e-8):
+            src = np.array(
+                [[0.0, 0.0], [float(Ws - 1), 0.0], [float(Ws - 1), float(Hs - 1)], [0.0, float(Hs - 1)]],
+                dtype=np.float32,
+            )
+            dst = corners_2d.astype(np.float32)
+            Hmat = None
+            try:
+                Hmat = cv2.getPerspectiveTransform(src, dst)
+            except Exception:
+                pass
+            if Hmat is not None:
+                hi, wi = int(img.shape[0]), int(img.shape[1])
+                warped = cv2.warpPerspective(
+                    tag_img,
+                    Hmat,
+                    (wi, hi),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                mask = cv2.warpPerspective(
+                    np.ones((Hs, Ws), dtype=np.uint8) * 255,
+                    Hmat,
+                    (wi, hi),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                m = mask > 0
+                img[m] = warped[m]
+                return
+
+        # Distorted camera: keep tessellation but use finer cells so projected
+        # cells stay closer to constant-depth patches under ``projectPoints``.
+        gs = self._tessellation_gs_from_img_quad(
+            corners_2d,
+            lo=32,
+            hi=100,
+            px_per_cell=2.0,
         )
-        mask3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
-        img[:] = (mask3 * warped + (1 - mask3) * img).astype(np.uint8)
+        p0, p1, p2, p3 = world_corners[0], world_corners[1], world_corners[2], world_corners[3]
+        for i in range(gs):
+            u0, u1 = i / gs, (i + 1) / gs
+            for j in range(gs):
+                v0, v1 = j / gs, (j + 1) / gs
+                w00 = self._bilinear_quad_3d(p0, p1, p2, p3, u0, v0)
+                w10 = self._bilinear_quad_3d(p0, p1, p2, p3, u1, v0)
+                w11 = self._bilinear_quad_3d(p0, p1, p2, p3, u1, v1)
+                w01 = self._bilinear_quad_3d(p0, p1, p2, p3, u0, v1)
+                corners_w = np.stack([w00, w10, w11, w01], axis=0)
+                uc = 0.5 * (u0 + u1)
+                vc = 0.5 * (v0 + v1)
+                color = self._sample_tag_rgb_bilinear(tag_img, uc, vc)
+                self._paint_world_quadrilateral(
+                    img,
+                    corners_w,
+                    rvec,
+                    tvec,
+                    K,
+                    D,
+                    R_cw,
+                    tvec,
+                    color,
+                )
 
     def on_joint_step(self, q_class: np.ndarray, *, duration: float = 0.4) -> None:
         q_target = np.asarray(q_class, dtype=float).reshape(6)

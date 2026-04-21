@@ -212,6 +212,58 @@ class RobotController:
         self.theta_seed = theta_mod.copy()
         return True, theta_mod, info
 
+    def move_to_camera_pose(
+        self,
+        T_target: np.ndarray,
+        T5c: np.ndarray,
+        *,
+        theta_seed: np.ndarray | None = None,
+        wait: bool = True,
+        position_only: bool = False,
+        trans_weight: float = 1.0,
+        rot_weight: float = 1.0,
+        pos_tol: float = 1e-4,
+        rot_tol: float = 1e-3,
+        max_iter: int = 80,
+        pre_solve_position: bool = False,
+    ) -> tuple[bool, np.ndarray, dict]:
+        """IK so ``kin.fk_to_frame(q,5) @ T5c`` matches ``T_target``, then movej.
+
+        Use this for scan poses where the camera is mounted on link 5. The
+        standard :meth:`move_to_pose` / flange ``T6t`` chain does not match that
+        mount.
+
+        Set ``position_only=True`` when the target is an over-specified full SE(3)
+        and you only care about camera **position**. Otherwise use ``trans_weight``
+        / ``rot_weight`` to trade a small position error for orientation (e.g. look
+        downward at scan points).
+        """
+        seed = self.theta_seed if theta_seed is None else np.asarray(theta_seed, dtype=float).reshape(6)
+
+        theta_mod, _, info = self.kin.ik_camera_mount(
+            T_target,
+            T5c,
+            theta_seed=seed,
+            position_only=position_only,
+            trans_weight=trans_weight,
+            rot_weight=rot_weight,
+            pos_tol=pos_tol,
+            rot_tol=rot_tol,
+            max_iter=max_iter,
+            pre_solve_position=pre_solve_position,
+        )
+        if (not info.get("success", False)) or np.any(np.isnan(theta_mod)):
+            if self.verbose:
+                print(f"[robot] move_to_camera_pose: IK failed ({info.get('message','')})")
+            return False, seed, info
+
+        q_class = self.kin.dh_modified_to_classical(theta_mod)
+        q_cmd = shortest_joint_motion_target(self.current_q_class, q_class)
+        self.renderer.on_demo_checkpoint()
+        self.movej(q_cmd, wait=wait)
+        self.theta_seed = theta_mod.copy()
+        return True, theta_mod, info
+
     def home(
         self,
         T_home: np.ndarray,

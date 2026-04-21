@@ -28,6 +28,7 @@ Key facts from the Lab 3 spec that this module is built to respect:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from enum import Enum, IntEnum
 import threading
 import time
@@ -40,8 +41,8 @@ from typing_extensions import Annotated
 from .detector import ArucoDetector
 from .kinematics import UR10e
 from .robot import RobotController
-from .sim import DemoAbort, NullRenderer, SimulationRenderer
-from .transforms import make_T, make_T_rpy
+from .sim import DemoAbort, NullRenderer, SimulationRenderer, ViserRenderer
+from .transforms import fuse_rigid_transforms, make_T, make_T_rpy
 
 
 class BoxTag(IntEnum):
@@ -90,6 +91,7 @@ GRASP_ORIENTATION: np.ndarray = np.array(
     dtype=float,
 )
 
+DEFAULT_SCAN_HEIGHT = 0.6
 
 def grasp_orientation_from_measured_tag(
     T_base_aruco: np.ndarray,
@@ -133,14 +135,24 @@ class HanoiDetector(ArucoDetector):
     block_thickness: float = 0.05  # per PDF Part 2 prep (a)
     pad_size: float = 0.20  # per PDF Part 3 prep (b)
 
-    def find_tag_poses(self, frame: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    def find_tag_poses(
+        self,
+        frame: np.ndarray,
+        *,
+        camera_matrix: np.ndarray | None = None,
+        dist_coeffs: np.ndarray | None = None,
+    ) -> list[tuple[int, np.ndarray]]:
         """Return ``[(tag_id, T_cam_marker), ...]`` for every ArUco tag in ``frame``.
 
         Note: this returns the *camera-frame* pose of each marker, not the base
         frame. Callers that need base-frame poses should multiply by the current
         camera-in-base transform (``T_base_cam @ T_cam_marker``).
+
+        Optional ``camera_matrix`` / ``dist_coeffs`` are forwarded to
+        :meth:`~me235b.detector.ArucoDetector.find_tags` for ``solvePnP`` and
+        should match how ``frame`` was rasterized.
         """
-        detections = self.find_tags(frame)
+        detections = self.find_tags(frame, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
         results: list[tuple[int, np.ndarray]] = []
         for tag_id, rvec, tvec in detections:
             import cv2
@@ -300,19 +312,230 @@ def _scan_detections_complete(
     return len(box_detections) == len(BoxTag) and len(pad_detections) == len(PadTag)
 
 
-def _default_scan_points(scan_height: float = 0.4) -> np.ndarray:
+def _create_point_grid(xmin: float, xmax: float, ymin: float, ymax: float, x_points: int, y_points: int, scan_height: float) -> np.ndarray:
+    x_cell = (xmax - xmin) / x_points
+    y_cell = (ymax - ymin) / y_points
+    x_grid, y_grid = np.meshgrid(np.arange(xmin, xmax + x_cell, x_cell), np.arange(ymin, ymax + y_cell, y_cell))
+    points = np.column_stack((x_grid.flatten(), y_grid.flatten(), np.full(x_grid.size, scan_height)))
+    return points
+
+
+def _default_scan_points(scan_height: float = DEFAULT_SCAN_HEIGHT) -> np.ndarray:
     """Six scan positions tiled across :data:`TAG_WORKSPACE_*` in the base frame."""
-    return np.array(
-        [
-            [-0.35, -0.33, scan_height],
-            [0.0, -0.33, scan_height],
-            [0.35, -0.33, scan_height],
-            [-0.35, -0.67, scan_height],
-            [0.0, -0.67, scan_height],
-            [0.35, -0.67, scan_height],
-        ],
-        dtype=float,
-    )
+    # return np.array(
+    #     [
+    #         [-0.35, -0.33, scan_height],
+    #         [0.0, -0.33, scan_height],
+    #         [0.35, -0.33, scan_height],
+    #         [-0.35, -0.67, scan_height],
+    #         [0.0, -0.67, scan_height],
+    #         [0.35, -0.67, scan_height],
+    #     ],
+    #     dtype=float,
+    # )
+    y_points = 4
+    x_points = 4
+    x_min = -0.5#TAG_WORKSPACE_X_MIN
+    x_max = 0.5#TAG_WORKSPACE_X_MAX
+    y_min = -0.7#TAG_WORKSPACE_Y_MIN
+    y_max = -0.3#TAG_WORKSPACE_Y_MAX - 0.4
+    return _create_point_grid(x_min, x_max, y_min, y_max, x_points, y_points, scan_height)
+
+
+# Shared with :meth:`HanoiTask.scan` and :func:`compute_auto_scan_points` so scan
+# motion matches offline feasibility checks.
+_SCAN_CAMERA_MOUNT_IK: dict[str, float | bool | int] = {
+    "position_only": False,
+    "trans_weight": 20.0,
+    "rot_weight": 1.0,
+    "pos_tol": 1.0e-2,
+    "rot_tol": 0.85,
+    "max_iter": 120,
+    "pre_solve_position": True,
+}
+
+
+def _bootstrap_theta_for_scan_planning(kin: UR10e, T_home: np.ndarray) -> np.ndarray:
+    """Flange IK at ``T_home`` gives a joint seed in the same neighborhood as ``home()``."""
+    T_home = np.asarray(T_home, dtype=float).reshape(4, 4)
+    th, _, info = kin.ik(T_home, theta_seed=np.zeros(6, dtype=float))
+    if info.get("success", False) and not np.any(np.isnan(th)):
+        return np.asarray(th, dtype=float).reshape(6)
+    return np.zeros(6, dtype=float)
+
+
+def _scan_cell_index(
+    x: float,
+    y: float,
+    *,
+    x_min: float,
+    y_min: float,
+    cell: float,
+    nx: int,
+    ny: int,
+) -> tuple[int, int]:
+    ix = int((float(x) - float(x_min)) / float(cell))
+    iy = int((float(y) - float(y_min)) / float(cell))
+    return int(np.clip(ix, 0, nx - 1)), int(np.clip(iy, 0, ny - 1))
+
+
+def _farthest_point_indices(xy: np.ndarray, k: int) -> list[int]:
+    """Greedy max-min subsample of ``xy`` rows (2D points) down to ``k`` indices."""
+    n = int(xy.shape[0])
+    if k <= 0 or n == 0:
+        return []
+    if k >= n:
+        return list(range(n))
+    chosen = [0]
+    dist = np.linalg.norm(xy - xy[0], axis=1)
+    while len(chosen) < k:
+        j = int(np.argmax(dist))
+        if float(dist[j]) <= 1e-9:
+            break
+        chosen.append(j)
+        dist = np.minimum(dist, np.linalg.norm(xy - xy[j], axis=1))
+    return sorted(set(chosen))
+
+
+def _chain_validate_scan_points(
+    kin: UR10e,
+    T5c: np.ndarray,
+    points: list[np.ndarray],
+    *,
+    T_home: np.ndarray,
+) -> list[np.ndarray]:
+    """Keep poses that succeed under the same IK chaining used at scan runtime."""
+    T_home = np.asarray(T_home, dtype=float).reshape(4, 4)
+    T5c = np.asarray(T5c, dtype=float).reshape(4, 4)
+    seed = _bootstrap_theta_for_scan_planning(kin, T_home)
+    ok_list: list[np.ndarray] = []
+    for p in points:
+        T_bc = make_T_rpy(np.asarray(p, dtype=float).reshape(3), [np.pi, 0.0, 0.0])
+        th, _, info = kin.ik_camera_mount(
+            T_bc,
+            T5c,
+            theta_seed=seed,
+            **_SCAN_CAMERA_MOUNT_IK,
+        )
+        if not info.get("success", False) or np.any(np.isnan(th)):
+            continue
+        seed = th
+        ok_list.append(np.asarray(p, dtype=float).reshape(3))
+    return ok_list
+
+
+def compute_auto_scan_points(
+    kin: UR10e,
+    T5c: np.ndarray,
+    *,
+    T_home: np.ndarray | None = None,
+    scan_height: float = DEFAULT_SCAN_HEIGHT,
+    cell_size: float = 0.22,
+    sample_step: float = 0.11,
+    max_points: int = 0,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Pick base-frame camera positions over the tag workspace with feasible link-5 IK.
+
+    Candidates lie on a regular ``(x, y)`` grid at ``z = scan_height`` with the lab
+    top-down camera RPY target (``roll=π``). For each grid cell, the pose with
+    the smallest IK rotation error is kept so the realized view stays as close
+    to straight-down as the five controllable joints allow, while tiling ``xy``
+    for coverage.
+
+    Falls back toward :func:`_default_scan_points` if the grid yields too few poses.
+    """
+    T_home = _default_home_pose() if T_home is None else np.asarray(T_home, dtype=float).reshape(4, 4)
+    T5c = np.asarray(T5c, dtype=float).reshape(4, 4)
+    cell = max(0.05, float(cell_size))
+    step = max(0.04, float(sample_step))
+    if step > cell * 0.95:
+        step = cell * 0.5
+
+    x_min, x_max = float(TAG_WORKSPACE_X_MIN), float(TAG_WORKSPACE_X_MAX)
+    y_min, y_max = float(TAG_WORKSPACE_Y_MIN), float(TAG_WORKSPACE_Y_MAX)
+    nx = max(1, int(np.ceil((x_max - x_min) / cell)))
+    ny = max(1, int(np.ceil((y_max - y_min) / cell)))
+
+    xs = np.arange(x_min, x_max + 0.5 * step, step, dtype=float)
+    ys = np.arange(y_min, y_max + 0.5 * step, step, dtype=float)
+    candidates: list[tuple[float, float]] = [(float(x), float(y)) for y in ys for x in xs]
+
+    seed = _bootstrap_theta_for_scan_planning(kin, T_home)
+    # Deterministic sweep: outer y then x matches a natural scan path.
+    candidates.sort(key=lambda xy: (xy[1], xy[0]))
+
+    successes: list[tuple[np.ndarray, float, float, tuple[int, int]]] = []
+    for x, y in candidates:
+        T_bc = make_T_rpy(np.array([x, y, float(scan_height)], dtype=float), [np.pi, 0.0, 0.0])
+        th, _, info = kin.ik_camera_mount(
+            T_bc,
+            T5c,
+            theta_seed=seed,
+            **_SCAN_CAMERA_MOUNT_IK,
+        )
+        if not info.get("success", False) or np.any(np.isnan(th)):
+            continue
+        seed = th
+        rot_e = float(info.get("rot_err_rad", 1.0e9))
+        pos_e = float(info.get("pos_err_m", 1.0e9))
+        cell_key = _scan_cell_index(x, y, x_min=x_min, y_min=y_min, cell=cell, nx=nx, ny=ny)
+        successes.append((np.array([x, y, float(scan_height)], dtype=float), rot_e, pos_e, cell_key))
+
+    best_by_cell: dict[tuple[int, int], tuple[np.ndarray, float, float]] = {}
+    for xyz, rot_e, pos_e, ck in successes:
+        prev = best_by_cell.get(ck)
+        if prev is None or rot_e < prev[1] or (rot_e == prev[1] and pos_e < prev[2]):
+            best_by_cell[ck] = (xyz, rot_e, pos_e)
+
+    chosen: list[np.ndarray] = [t[0] for t in best_by_cell.values()]
+    chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+    chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
+
+    def _try_add_default() -> None:
+        seed_d = _bootstrap_theta_for_scan_planning(kin, T_home)
+        for p in _default_scan_points(scan_height):
+            x, y = float(p[0]), float(p[1])
+            T_bc = make_T_rpy(np.asarray(p, dtype=float).reshape(3), [np.pi, 0.0, 0.0])
+            th, _, info = kin.ik_camera_mount(
+                T_bc,
+                T5c,
+                theta_seed=seed_d,
+                **_SCAN_CAMERA_MOUNT_IK,
+            )
+            if not info.get("success", False) or np.any(np.isnan(th)):
+                continue
+            seed_d = th
+            ck = _scan_cell_index(x, y, x_min=x_min, y_min=y_min, cell=cell, nx=nx, ny=ny)
+            if ck not in best_by_cell:
+                best_by_cell[ck] = (np.asarray(p, dtype=float).reshape(3), float(info.get("rot_err_rad", 0.0)), 0.0)
+
+    if len(chosen) < 4:
+        _try_add_default()
+        chosen = [t[0] for t in best_by_cell.values()]
+        chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+        chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
+
+    if len(chosen) == 0:
+        if verbose:
+            print("[hanoi] auto scan points: no feasible poses; using default scan grid.")
+        return _default_scan_points(scan_height)
+
+    max_pts = int(max_points)
+    if max_pts > 0 and len(chosen) > max_pts:
+        xy = np.array([[float(p[0]), float(p[1])] for p in chosen], dtype=float)
+        keep = _farthest_point_indices(xy, max_pts)
+        chosen = [chosen[i] for i in keep]
+        chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+        chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
+
+    out = np.stack(chosen, axis=0)
+    if verbose:
+        print(
+            f"[hanoi] auto scan points: {out.shape[0]} poses "
+            f"(workspace cells {nx}x{ny}, step={step:.3f} m, cell={cell:.3f} m)."
+        )
+    return out
 
 
 class HanoiTask:
@@ -347,6 +570,7 @@ class HanoiTask:
         scan_settle_s: float = 0.0,
         synthetic_scan_detection: bool = False,
         tag_grasp_orientation: bool = False,
+        sim_vision_gt_tolerance_m: float | None = None,
     ) -> None:
         self.controller = controller
         self.detector = detector
@@ -358,23 +582,17 @@ class HanoiTask:
         self.scan_settle_s = float(scan_settle_s)
         self.synthetic_scan_detection = bool(synthetic_scan_detection)
         self.tag_grasp_orientation = bool(tag_grasp_orientation)
+        self._sim_vision_gt_tolerance_m = (
+            None if sim_vision_gt_tolerance_m is None else float(sim_vision_gt_tolerance_m)
+        )
+        self._sim_gt_pad_centers: dict[PadTag, np.ndarray] | None = None
+        self._sim_gt_block_centers: dict[BoxTag, np.ndarray] | None = None
         self._demo_layout_cp: tuple[
             dict[PadTag, np.ndarray],
             dict[PadTag, list[BoxTag]],
             dict[BoxTag, np.ndarray],
             dict[BoxTag, np.ndarray],
         ] | None = None
-
-        # Camera-side kinematics: IK targets are camera poses ~= T_b6 @ T5c.
-        # (The exact camera pose is T_B5 @ T5c, which differs by the joint-6
-        # transform; we accept this approximation when *moving* to a scan point
-        # and compute the *actual* camera pose from frame-5 FK after the move.)
-        self.camera_kin = UR10e(
-            T6t=self.T5c,
-            joint_limits_rad=controller.kin.joint_limits_rad,
-            joint_limit_margin_rad=controller.kin.joint_limit_margin_rad,
-            external_safety_filter=controller.kin.external_safety_filter,
-        )
 
         self._box_handles: dict[BoxTag, str] = {}
         self._pad_handles: dict[PadTag, str] = {}
@@ -403,6 +621,77 @@ class HanoiTask:
     def home(self) -> dict:
         """Drive the gripper to the configured home pose."""
         return self.controller.home(self.T_home, verify_fk=True)
+
+    def _strict_vision_sim(self) -> bool:
+        """Simulate with Viser synthetic frames only (vision-first / IRL parity path)."""
+        return bool(
+            self.controller.simulate
+            and self.camera is None
+            and self.synthetic_scan_detection
+        )
+
+    def _raise_if_sim_vision_gt_exceeds_tolerance(self) -> None:
+        """Sim oracle: fail when ingested centers drift from last Randomize layout.
+
+        This is **not** rigid-body physics (no contacts, slip, or dynamics). It is an
+        optional consistency check that synthetic vision + fusion recovered the same
+        pad/block centers (base frame) that :meth:`randomize_sim_layout` established.
+        """
+        tol = self._sim_vision_gt_tolerance_m
+        if tol is None or tol <= 0.0:
+            return
+        gt_p = self._sim_gt_pad_centers
+        gt_b = self._sim_gt_block_centers
+        if gt_p is None or gt_b is None:
+            return
+        if any(p not in gt_p for p in PadTag) or any(b not in gt_b for b in BoxTag):
+            return
+
+        worst = 0.0
+        worst_name = ""
+        for p in PadTag:
+            if p not in self.pad_centers:
+                return
+            e = float(np.linalg.norm(self.pad_centers[p] - gt_p[p]))
+            if e > worst:
+                worst, worst_name = e, f"pad {p.name}"
+        for b in BoxTag:
+            if b not in self.block_centers:
+                return
+            e = float(np.linalg.norm(self.block_centers[b] - gt_b[b]))
+            if e > worst:
+                worst, worst_name = e, f"block {b.name}"
+        if worst > tol:
+            raise ValueError(
+                f"Sim vision vs Randomize layout: max center error {worst:.4f} m at {worst_name} "
+                f"(tolerance {tol} m). Tighten scan / intrinsics or increase tolerance."
+            )
+
+    def _reset_planner_state_only(self) -> None:
+        """Clear pad/block world model without removing Viser meshes (used before re-scan)."""
+        self.pad_centers.clear()
+        self.pad_stacks = {p: [] for p in PadTag}
+        self.block_centers.clear()
+        self._block_grasp_R.clear()
+        self._holding = None
+
+    def _clear_scene_and_planner_for_strict_scan(self) -> None:
+        """Empty the scene and planner so the first successful scan defines everything."""
+        self.renderer.clear_hanoi_scene_objects()
+        self._box_handles.clear()
+        self._pad_handles.clear()
+        self._reset_planner_state_only()
+
+    def _require_full_world_model(self) -> None:
+        """Raise if any lab tag is missing from the world model (hardware and strict sim)."""
+        missing_pads = [p for p in PadTag if p not in self.pad_centers]
+        missing_boxes = [b for b in BoxTag if b not in self.block_centers]
+        if missing_pads or missing_boxes:
+            missing = [t.name for t in (*missing_pads, *missing_boxes)]
+            raise ValueError(
+                f"HanoiTask.run: scan did not find all required tags (missing: {missing}). "
+                "Check camera exposure and scan point coverage."
+            )
 
     def _grab_frame(self, *, flush: int = 3) -> np.ndarray | None:
         """Read a frame from the camera, flushing a few stale buffered frames first.
@@ -439,21 +728,36 @@ class HanoiTask:
         :meth:`_ingest_detections` is not called (caller supplies poses).
 
         If ``synthetic_scan_detection`` is true (Viser path), a synthetic
-        full-resolution frame is rendered with the same **K** (and image size)
-        as :class:`HanoiDetector` but **without** lens distortion in the raster
-        (distortion + flat mesh/tag warps looked unrealistic); ``find_tag_poses``
-        still uses the lab distortion vector in ``solvePnP``. A complete tag set
-        is ingested; otherwise the prior model is left unchanged.
+        frame is rendered at **640×480** with the renderer's **K** and **D**
+        (lab PDF calibration, or ideal pinhole if Viser was built with
+        ``sim_camera_intrinsics="simple"``), matching
+        :meth:`me235b.sim.ViserRenderer.synthetic_aruco_intrinsics`.
+        A complete tag set is ingested; otherwise the prior model is left unchanged
+        (unless :meth:`HanoiTask._run_body` strict vision mode cleared it first).
+
+        Repeated sightings of the same tag across scan poses are merged with
+        :func:`me235b.transforms.fuse_rigid_transforms` (MAD outlier rejection on
+        translation norms, then on rotation tangent norms). Viser draws one triad
+        per fused **marker** pose (full 4×4: tag origin on the pad corner or block
+        face). The internal world model from :meth:`_ingest_detections` still uses
+        pad centers and stack-based block ``z`` as in the lab spec.
         """
-        box_detections: dict[BoxTag, np.ndarray] = {}
-        pad_detections: dict[PadTag, np.ndarray] = {}
+        box_samples: defaultdict[BoxTag, list[np.ndarray]] = defaultdict(list)
+        pad_samples: defaultdict[PadTag, list[np.ndarray]] = defaultdict(list)
 
         self.renderer.clear_scan_pose_estimates()
 
         n_scan = len(self.scan_points)
         for scan_index, scan_point in enumerate(self.scan_points):
             T_bc = make_T_rpy(scan_point, [np.pi, 0.0, 0.0])
-            ok, _theta, info = self.controller.move_to_pose(T_bc, kinematics=self.camera_kin)
+            # Weighted pose after position pre-solve: link-5 has 5 DOF, so full RPY is
+            # not reachable; SciPy refines toward downward view while holding the grid
+            # point (see :meth:`me235b.kinematics.UR10e.ik_camera_mount`).
+            ok, _theta, info = self.controller.move_to_camera_pose(
+                T_bc,
+                self.T5c,
+                **_SCAN_CAMERA_MOUNT_IK,
+            )
             if not ok:
                 if self.controller.verbose:
                     print(f"[hanoi] scan move IK failed at {scan_point}: {info.get('message','')}")
@@ -480,20 +784,33 @@ class HanoiTask:
 
             T_base_cam = self._current_T_base_cam()
 
-            for tag_id, T_cam_marker in self.detector.find_tag_poses(frame):
+            # solvePnP must use the same (K, D) as the synthetic raster (Viser).
+            pnp_K: np.ndarray | None = None
+            pnp_D: np.ndarray | None = None
+            if self.camera is None and self.synthetic_scan_detection:
+                intr_fn = getattr(self.renderer, "synthetic_aruco_intrinsics", None)
+                if intr_fn is not None:
+                    pair = intr_fn()
+                    if pair is not None:
+                        pnp_K, pnp_D = pair
+            tag_iter = self.detector.find_tag_poses(
+                frame,
+                camera_matrix=pnp_K,
+                dist_coeffs=pnp_D,
+            )
+
+            for tag_id, T_cam_marker in tag_iter:
                 T_base_marker = T_base_cam @ T_cam_marker
 
                 try:
                     box = BoxTag(tag_id)
-                    box_detections[box] = T_base_marker
-                    self.renderer.add_scan_pose_estimate(f"scan{scan_index}_box{tag_id}", T_base_marker)
+                    box_samples[box].append(T_base_marker)
                     continue
                 except ValueError:
                     pass
                 try:
                     pad = PadTag(tag_id)
-                    pad_detections[pad] = T_base_marker
-                    self.renderer.add_scan_pose_estimate(f"scan{scan_index}_pad{tag_id}", T_base_marker)
+                    pad_samples[pad].append(T_base_marker)
                     continue
                 except ValueError:
                     pass
@@ -501,6 +818,16 @@ class HanoiTask:
                     print(f"[hanoi] ignoring non-Hanoi tag id={tag_id}")
 
             self.renderer.on_demo_checkpoint()
+
+        box_detections: dict[BoxTag, np.ndarray] = {
+            tag: fuse_rigid_transforms(samples) for tag, samples in box_samples.items()
+        }
+        pad_detections: dict[PadTag, np.ndarray] = {
+            tag: fuse_rigid_transforms(samples) for tag, samples in pad_samples.items()
+        }
+
+        for name, T in self._scan_plot_transforms(box_detections, pad_detections):
+            self.renderer.add_scan_pose_estimate(name, T)
 
         ingest = False
         if self.camera is not None:
@@ -525,6 +852,7 @@ class HanoiTask:
 
         if ingest:
             self._ingest_detections(box_detections, pad_detections)
+            self._raise_if_sim_vision_gt_exceeds_tolerance()
         elif (
             self.controller.simulate
             and self.synthetic_scan_detection
@@ -538,6 +866,26 @@ class HanoiTask:
             )
 
         return box_detections, pad_detections
+
+    def _scan_plot_transforms(
+        self,
+        box_detections: dict[BoxTag, np.ndarray],
+        pad_detections: dict[PadTag, np.ndarray],
+    ) -> list[tuple[str, np.ndarray]]:
+        """World-frame **fused marker** poses for Viser scan triads.
+
+        Each frame is the full fused 4×4 from PnP + :func:`fuse_rigid_transforms`
+        (tag corner on the pad, tag on the block top face). That matches the
+        geometry OpenCV reports, so triad origins sit on the actual markers and
+        offsets vs meshes are easy to read. Ingest still uses pad centers / stack z
+        in :meth:`_ingest_detections`.
+        """
+        out: list[tuple[str, np.ndarray]] = []
+        for tag, T_aruco in pad_detections.items():
+            out.append((f"fused_tag_pad_{int(tag)}", np.asarray(T_aruco, dtype=float).copy()))
+        for box, T_aruco in box_detections.items():
+            out.append((f"fused_tag_box_{int(box)}", np.asarray(T_aruco, dtype=float).copy()))
+        return out
 
     def _ingest_detections(
         self,
@@ -783,6 +1131,9 @@ class HanoiTask:
             boxes[tag] = make_T(aruco_pos, R_id)
 
         self._ingest_detections(boxes, pads)
+        if self._sim_vision_gt_tolerance_m is not None and self._sim_vision_gt_tolerance_m > 0.0:
+            self._sim_gt_pad_centers = {k: v.copy() for k, v in self.pad_centers.items()}
+            self._sim_gt_block_centers = {k: v.copy() for k, v in self.block_centers.items()}
         self.populate_scene()
         self.renderer.clear_scan_pose_estimates()
 
@@ -941,13 +1292,42 @@ class HanoiTask:
             TAG_WORKSPACE_Y_MAX,
         )
 
+        # Viser + sim without synthetic vision cannot match the hardware vision path.
+        if (
+            self.controller.simulate
+            and self.camera is None
+            and isinstance(self.renderer, ViserRenderer)
+            and not self.synthetic_scan_detection
+        ):
+            raise RuntimeError(
+                "Lab 3 simulate + Viser requires synthetic vision (default on with Viser). "
+                "Use --render none for offline PDF seeding without vision parity, or enable "
+                "synthetic scan detection."
+            )
+
         pre_populated = False
-        if self.camera is None and self.controller.simulate:
+
+        if self._strict_vision_sim():
+            if not skip_sim_auto_seed:
+                self._clear_scene_and_planner_for_strict_scan()
+            else:
+                # Interactive: meshes already placed by randomize; re-scan defines the planner.
+                self._reset_planner_state_only()
+            self.scan()
+            self._require_full_world_model()
+            self.populate_scene()
+            pre_populated = True
+        elif self.camera is None and self.controller.simulate:
+            if self.controller.verbose:
+                print(
+                    "[hanoi] simulate without Viser synthetic vision: using PDF seed; "
+                    "IRL parity is not guaranteed."
+                )
             if not skip_sim_auto_seed:
                 if self.controller.verbose:
                     print(
                         "[hanoi] no camera + simulate=True -> seed scene from PDF layout, "
-                        "then scan motion + synthetic views."
+                        "then scan motion."
                     )
                 box_detections, pad_detections = self._fake_detections()
                 self._ingest_detections(box_detections, pad_detections)
@@ -962,14 +1342,7 @@ class HanoiTask:
             self.scan()
 
         if not self.controller.simulate:
-            missing_pads = [p for p in PadTag if p not in self.pad_centers]
-            missing_boxes = [b for b in BoxTag if b not in self.block_centers]
-            if missing_pads or missing_boxes:
-                missing = [t.name for t in (*missing_pads, *missing_boxes)]
-                raise ValueError(
-                    f"HanoiTask.run: scan did not find all required tags (missing: {missing}). "
-                    "Check camera exposure and scan point coverage."
-                )
+            self._require_full_world_model()
 
         if not pre_populated:
             self.populate_scene()
@@ -984,13 +1357,32 @@ class RenderMode(str, Enum):
     viser = "viser"
 
 
-def _build_renderer(mode: RenderMode, kin: UR10e) -> SimulationRenderer | None:
+class ViserSimCamera(str, Enum):
+    """Synthetic on-arm camera intrinsics (Viser + simulate only)."""
+
+    lab = "lab"
+    simple = "simple"
+
+
+def _build_renderer(
+    mode: RenderMode,
+    kin: UR10e,
+    *,
+    viser_show_live_camera: bool = True,
+    viser_sim_camera: ViserSimCamera = ViserSimCamera.lab,
+    viser_scan_gallery_width: int = 200,
+) -> SimulationRenderer | None:
     if mode is RenderMode.none:
         return None
     if mode is RenderMode.viser:
         from .sim import ViserRenderer
 
-        return ViserRenderer(kin)
+        return ViserRenderer(
+            kin,
+            show_camera_view=viser_show_live_camera,
+            sim_camera_intrinsics=viser_sim_camera.value,
+            scan_gallery_thumb_width=max(1, int(viser_scan_gallery_width)),
+        )
     raise ValueError(f"Unknown render mode: {mode!r}")
 
 
@@ -1014,10 +1406,27 @@ def run_hanoi(
     synthetic_scan_detection: Annotated[
         bool,
         typer.Option(
-            help="With --simulate and Viser, run ArUco on rendered camera frames "
-            "at lab intrinsics (instead of trusting seed geometry alone).",
+            help="With --simulate and Viser, required for vision parity: ArUco on "
+            "synthetic frames (renderer K/D); scene/plan come only from a full scan.",
         ),
     ] = True,
+    viser_sim_camera: Annotated[
+        ViserSimCamera,
+        typer.Option(
+            help="Viser synthetic camera only: 'lab' = PDF K/D (hardware parity); "
+            "'simple' = ideal pinhole (~58° HFOV, D=0) for cleaner sim / camera-agnostic "
+            "localization debugging. Real runs (--no-simulate) still use the detector's lab K/D.",
+        ),
+    ] = ViserSimCamera.lab,
+    auto_scan_points: Annotated[
+        bool,
+        typer.Option(
+            "--auto-scan-points/--no-auto-scan-points",
+            help="Plan scan positions with link-5 camera IK over the tag workspace: "
+            "cover xy in cells, keep the most downward-feasible pose per cell, then "
+            "follow that path instead of the fixed lab grid.",
+        ),
+    ] = False,
     interactive_sim: Annotated[
         bool,
         typer.Option(
@@ -1032,10 +1441,44 @@ def run_hanoi(
             "default uses fixed base-aligned grasp from the PDF.",
         ),
     ] = False,
+    viser_live_camera: Annotated[
+        bool,
+        typer.Option(
+            "--viser-live-camera/--no-viser-live-camera",
+            help="With Viser, refresh the on-arm camera GUI (and frustum texture) on every "
+            "animation sub-step. Turn off to keep full synthetic rasterization only at scan "
+            "snapshots (faster motion preview).",
+        ),
+    ] = True,
+    viser_scan_gallery_width: Annotated[
+        int,
+        typer.Option(
+            help="Viser 'Scan i/n' gallery image width (pixels); height follows lab calibration "
+            "aspect or 4:3 in simple sim. Default 640 matches 640×480 synthetic / USB frames. "
+            "Use a smaller value (e.g. 200) for lighter UI.",
+        ),
+    ] = 640,
+    sim_vision_gt_tolerance_m: Annotated[
+        float | None,
+        typer.Option(
+            "--sim-vision-gt-tolerance-m",
+            help=(
+                "With --simulate and interactive Viser: after Randomize, abort if a full "
+                "synthetic scan's ingested pad/block centers differ from that layout by more "
+                "than this (meters; max Euclidean over all pads/blocks). Sim-oracle check only."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run the Lab 3 Tower-of-Hanoi sequence."""
     kin = UR10e(T6t=make_T([0.0, 0.0, float(tool_z_offset)]))
-    renderer = _build_renderer(render, kin)
+    renderer = _build_renderer(
+        render,
+        kin,
+        viser_show_live_camera=viser_live_camera,
+        viser_sim_camera=viser_sim_camera,
+        viser_scan_gallery_width=viser_scan_gallery_width,
+    )
     use_synth = bool(
         simulate and synthetic_scan_detection and render is RenderMode.viser
     )
@@ -1061,6 +1504,15 @@ def run_hanoi(
             if not camera.isOpened():
                 raise RuntimeError(f"run_hanoi: cv2.VideoCapture({camera_index}) failed to open.")
 
+        planned_scan: np.ndarray | None = None
+        if auto_scan_points:
+            planned_scan = compute_auto_scan_points(
+                kin,
+                T5C_DEFAULT,
+                T_home=_default_home_pose(),
+                verbose=controller.verbose,
+            )
+
         task = HanoiTask(
             controller,
             detector,
@@ -1069,6 +1521,8 @@ def run_hanoi(
             scan_settle_s=scan_settle_s,
             synthetic_scan_detection=use_synth,
             tag_grasp_orientation=tag_grasp_orientation,
+            scan_points=planned_scan,
+            sim_vision_gt_tolerance_m=sim_vision_gt_tolerance_m,
         )
         if use_interactive:
             from .sim import ViserRenderer
@@ -1087,6 +1541,11 @@ def run_hanoi(
                     except DemoAbort:
                         task.restore_demo_layout_checkpoint()
                         task.populate_scene()
+                    except (ValueError, RuntimeError) as exc:
+                        task.restore_demo_layout_checkpoint()
+                        task.populate_scene()
+                        if renderer._gui_demo_status is not None:
+                            renderer._gui_demo_status.value = f"Scan or run failed: {exc}"
                     finally:
                         if renderer._btn_randomize is not None:
                             renderer._btn_randomize.disabled = False
@@ -1096,6 +1555,17 @@ def run_hanoi(
                             )
 
             threading.Thread(target=_demo_worker, daemon=True).start()
+            # Keep the main thread alive for Viser, but do not run ``finally`` yet:
+            # ``renderer.close(wait=True)`` would block on stdin immediately and race
+            # with logs / the worker. One prompt here exits the whole process after
+            # the user is done with the web UI.
+            try:
+                input(
+                    "[viser] Interactive demo is running in the browser. "
+                    "Press Enter here when finished to exit...\n"
+                )
+            except (EOFError, KeyboardInterrupt):
+                pass
         else:
             task.run()
     finally:
@@ -1103,4 +1573,6 @@ def run_hanoi(
             camera.release()
         controller.close()
         if renderer is not None:
-            renderer.close(wait=(render is RenderMode.viser))
+            renderer.close(
+                wait=(render is RenderMode.viser and not use_interactive),
+            )

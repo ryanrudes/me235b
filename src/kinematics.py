@@ -13,7 +13,12 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from .transforms import as_6vec, inv_T, wrap_to_pi
+try:
+    from scipy.optimize import least_squares as _scipy_least_squares
+except ImportError:
+    _scipy_least_squares = None
+
+from .transforms import as_6vec, inv_T, so3_log, wrap_to_pi
 
 
 def dh_classical(a: float, alpha: float, d: float, theta: float) -> np.ndarray:
@@ -293,6 +298,358 @@ class UR10e:
             "joint_limit_margin_rad": self.joint_limit_margin_rad,
         }
         return theta_all[idx, :].copy(), theta_all, info
+
+    def fk_camera_on_link5(self, q, T5c: np.ndarray) -> np.ndarray:
+        """Base-to-camera transform: frame-5 FK composed with the mount ``T5c``."""
+        T5c = np.asarray(T5c, dtype=float).reshape(4, 4)
+        return self.fk_to_frame(as_6vec(q), 5) @ T5c
+
+    def ik_camera_mount(
+        self,
+        T_base_cam: np.ndarray,
+        T5c: np.ndarray,
+        *,
+        theta_seed: np.ndarray | None = None,
+        max_iter: int = 80,
+        pos_tol: float = 1e-4,
+        rot_tol: float = 1e-3,
+        fd_eps: float = 1e-4,
+        max_joint_step_rad: float = 0.35,
+        position_only: bool = False,
+        trans_weight: float = 1.0,
+        rot_weight: float = 1.0,
+        pre_solve_position: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Numerical IK so ``fk_to_frame(q, 5) @ T5c`` matches ``T_base_cam``.
+
+        The lab camera is modeled on link 5 (``fk_to_frame(..., 5)``), which
+        depends only on ``q[0]``…``q[4]`` in the classical chain. Joint ``q[5]``
+        does not move that pose; it is held at the seed (or bootstrap) value.
+
+        Only five joints actuate the link-5 frame, so a generic **full** SE(3)
+        camera pose is often **not** reachable. Options:
+
+        - ``position_only=True``: minimize translation only (fastest; orientation
+          is whatever the arm needs to hit the point).
+        - Otherwise the residual stacks rotation and translation. Use
+          ``trans_weight`` / ``rot_weight`` to trade a little position accuracy
+          for orientation (e.g. scan grids that should look **down** at the table).
+
+        Convergence is judged on **unweighted** ``pos_err_m`` / ``rot_err_rad``
+        vs ``pos_tol`` / ``rot_tol``.
+
+        ``pre_solve_position``: if True (and not ``position_only``), run a
+        translation-only solve first, then weighted least-squares refinement
+        (SciPy when available; Gauss–Newton otherwise). Strong ``trans_weight``
+        keeps the camera near the scan grid point while ``rot_weight`` pulls the
+        view toward the target RPY; five joints cannot match an arbitrary full
+        pose, so some angular error usually remains versus a perfect “straight
+        down” command.
+
+        Returns ``(theta_mod, theta_all, info)`` in the same convention as :meth:`ik`.
+        """
+        T_tgt = np.asarray(T_base_cam, dtype=float).reshape(4, 4)
+        T5c = np.asarray(T5c, dtype=float).reshape(4, 4)
+        seed = np.zeros(6, dtype=float) if theta_seed is None else as_6vec(theta_seed)
+
+        def _fail(msg: str) -> tuple[np.ndarray, np.ndarray, dict]:
+            return (
+                np.full(6, np.nan, dtype=float),
+                np.zeros((0, 6), dtype=float),
+                {"success": False, "message": msg, "thetaAll": np.zeros((0, 6)), "qAll_classical": np.zeros((0, 6))},
+            )
+
+        if (
+            pre_solve_position
+            and (not position_only)
+            and float(rot_weight) > 0.0
+            and float(trans_weight) > 0.0
+        ):
+            loose_pos = max(float(pos_tol) * 2.5, 3.0e-3)
+            th0, _, inf0 = self.ik_camera_mount(
+                T_base_cam,
+                T5c,
+                theta_seed=seed,
+                position_only=True,
+                max_iter=max_iter,
+                pos_tol=loose_pos,
+                fd_eps=fd_eps,
+                max_joint_step_rad=max_joint_step_rad,
+            )
+            if (not inf0.get("success", False)) or np.any(np.isnan(th0)):
+                return _fail(
+                    "ik_camera_mount: position pre-solve failed before orientation refinement."
+                )
+            seed = th0
+
+        q_seed = wrap_to_pi(as_6vec(self.dh_modified_to_classical(seed)))
+        w_t = float(trans_weight)
+        w_r = float(rot_weight)
+
+        def residual_vec(qc: np.ndarray, q5_lock: float) -> np.ndarray:
+            qc = np.asarray(qc, dtype=float).reshape(6)
+            qc[5] = q5_lock
+            T_cur = self.fk_camera_on_link5(qc, T5c)
+            t_err = T_tgt[:3, 3] - T_cur[:3, 3]
+            if position_only:
+                return np.asarray(t_err, dtype=float).reshape(3)
+            R_rel = T_cur[:3, :3].T @ T_tgt[:3, :3]
+            omega = so3_log(R_rel)
+            return np.concatenate([w_r * omega, w_t * t_err], dtype=float)
+
+        def pose_errors(qc: np.ndarray, q5_lock: float) -> tuple[float, float]:
+            """Report position and rotation error (always full pose), for ``info``."""
+            qc = np.asarray(qc, dtype=float).reshape(6)
+            qc[5] = q5_lock
+            T_cur = self.fk_camera_on_link5(qc, T5c)
+            t_err = T_tgt[:3, 3] - T_cur[:3, 3]
+            R_rel = T_cur[:3, :3].T @ T_tgt[:3, :3]
+            omega = so3_log(R_rel)
+            return float(np.linalg.norm(t_err)), float(np.linalg.norm(omega))
+
+        def within(qc: np.ndarray) -> bool:
+            return self._within_limits(qc) and self.safety_check(qc) and (
+                self.external_safety_filter is None or self.external_safety_filter(qc)
+            )
+
+        def within_step(qc: np.ndarray) -> bool:
+            """Line-search feasibility: limits + external filter (not full ``safety_check``)."""
+            return self._within_limits(qc) and (
+                self.external_safety_filter is None or self.external_safety_filter(qc)
+            )
+
+        use_scipy_refine = (
+            _scipy_least_squares is not None
+            and pre_solve_position
+            and (not position_only)
+            and w_r > 0.0
+            and w_t > 0.0
+        )
+        if use_scipy_refine:
+            q5_0 = float(q_seed[5])
+            lb = np.array([self.joint_limits_rad[i][0] for i in range(5)], dtype=float)
+            ub = np.array([self.joint_limits_rad[i][1] for i in range(5)], dtype=float)
+
+            def _pack_scipy(x: np.ndarray) -> np.ndarray:
+                qc = np.zeros(6, dtype=float)
+                qc[:5] = np.asarray(x, dtype=float).reshape(5)
+                qc[5] = q5_0
+                return qc
+
+            def _fun_scipy(x: np.ndarray) -> np.ndarray:
+                return residual_vec(_pack_scipy(x), q5_0)
+
+            ls = _scipy_least_squares(
+                _fun_scipy,
+                q_seed[:5].copy(),
+                bounds=(lb, ub),
+                ftol=1e-10,
+                xtol=1e-10,
+                gtol=1e-10,
+                max_nfev=1500,
+            )
+            q_sc = _pack_scipy(ls.x)
+            pos_e, rot_e = pose_errors(q_sc, q5_0)
+            if pos_e <= pos_tol and rot_e <= rot_tol and within(q_sc):
+                theta_mod = self.classical_to_dh_modified(q_sc)
+                theta_all = theta_mod.reshape(1, 6)
+                return theta_mod, theta_all, {
+                    "success": True,
+                    "message": "ik_camera_mount: scipy weighted refine.",
+                    "thetaAll": theta_all,
+                    "qAll_classical": q_sc.reshape(1, 6),
+                    "pos_err_m": pos_e,
+                    "rot_err_rad": rot_e,
+                    "position_only": False,
+                    "trans_weight": w_t,
+                    "rot_weight": w_r,
+                    "joint_limits_rad": self.joint_limits_rad,
+                    "joint_limit_margin_rad": self.joint_limit_margin_rad,
+                }
+            # SciPy moved off the tight pose tolerances, but the position pre-solve
+            # configuration still hits the scan grid — use it so lab scan moves complete.
+            q_fb = q_seed.copy()
+            pe0, re0 = pose_errors(q_fb, float(q_fb[5]))
+            if within(q_fb):
+                theta_mod_fb = self.classical_to_dh_modified(q_fb)
+                theta_all_fb = theta_mod_fb.reshape(1, 6)
+                return theta_mod_fb, theta_all_fb, {
+                    "success": True,
+                    "message": "ik_camera_mount: position-only fallback (scipy refine missed pose tolerances).",
+                    "thetaAll": theta_all_fb,
+                    "qAll_classical": q_fb.reshape(1, 6),
+                    "pos_err_m": pe0,
+                    "rot_err_rad": re0,
+                    "position_only": False,
+                    "trans_weight": w_t,
+                    "rot_weight": w_r,
+                    "joint_limits_rad": self.joint_limits_rad,
+                    "joint_limit_margin_rad": self.joint_limit_margin_rad,
+                }
+            return _fail(
+                f"ik_camera_mount: scipy refine out of tolerance (pos={pos_e:.3e} m, rot={rot_e:.3e} rad), "
+                f"and position seed unsafe (pos={pe0:.3e} m, rot={re0:.3e} rad)."
+            )
+
+        q = q_seed.copy()
+        if within(q):
+            pe, re = pose_errors(q, float(q[5]))
+            if position_only:
+                seed_ok = pe < pos_tol
+            else:
+                seed_ok = pe < pos_tol and re < rot_tol
+            if seed_ok:
+                theta_mod = self.classical_to_dh_modified(q)
+                theta_all = theta_mod.reshape(1, 6)
+                return theta_mod, theta_all, {
+                    "success": True,
+                    "message": "ik_camera_mount: seed already satisfies camera pose.",
+                    "thetaAll": theta_all,
+                    "qAll_classical": q.reshape(1, 6),
+                    "pos_err_m": pe,
+                    "rot_err_rad": re,
+                    "position_only": position_only,
+                    "trans_weight": w_t,
+                    "rot_weight": w_r,
+                    "joint_limits_rad": self.joint_limits_rad,
+                    "joint_limit_margin_rad": self.joint_limit_margin_rad,
+                }
+
+        if not within(q):
+            q = q_seed.copy()
+
+        q5_fixed = float(q[5])
+
+        r = residual_vec(q, q5_fixed)
+        res_dim = 3 if position_only else 6
+        best_q = q.copy()
+        pe0, re0 = pose_errors(q, q5_fixed)
+        if position_only:
+            converged = pe0 < pos_tol and within(q)
+        else:
+            converged = pe0 < pos_tol and re0 < rot_tol and within(q)
+        if converged:
+            theta_mod = self.classical_to_dh_modified(q)
+            theta_all = theta_mod.reshape(1, 6)
+            return theta_mod, theta_all, {
+                "success": True,
+                "message": "ik_camera_mount: already converged.",
+                "thetaAll": theta_all,
+                "qAll_classical": q.reshape(1, 6),
+                "pos_err_m": pe0,
+                "rot_err_rad": re0,
+                "position_only": position_only,
+                "trans_weight": w_t,
+                "rot_weight": w_r,
+                "joint_limits_rad": self.joint_limits_rad,
+                "joint_limit_margin_rad": self.joint_limit_margin_rad,
+            }
+
+        for _ in range(max_iter):
+            pe_i, re_i = pose_errors(q, q5_fixed)
+            if position_only:
+                if pe_i < pos_tol:
+                    best_q = q.copy()
+                    break
+            else:
+                if pe_i < pos_tol and re_i < rot_tol:
+                    best_q = q.copy()
+                    break
+            J = np.zeros((res_dim, 5), dtype=float)
+            for j in range(5):
+                e = np.zeros(6, dtype=float)
+                e[j] = fd_eps
+                r_p = residual_vec(q + e, q5_fixed)
+                r_m = residual_vec(q - e, q5_fixed)
+                J[:, j] = (r_p - r_m) / (2.0 * fd_eps)
+
+            rank = int(np.linalg.matrix_rank(J, tol=1e-8))
+            if rank < 1:
+                return _fail("ik_camera_mount: singular Jacobian.")
+            r2 = float(np.dot(r, r))
+            lm_lam = 1e-4 * (1.0 + r2)
+            jtj = J.T @ J + lm_lam * np.eye(5, dtype=float)
+            rhs = J.T @ (-r)
+            try:
+                dq5 = np.linalg.solve(jtj, rhs)
+            except np.linalg.LinAlgError:
+                try:
+                    dq5, _, _, _ = np.linalg.lstsq(jtj, rhs, rcond=1e-8)
+                except np.linalg.LinAlgError:
+                    return _fail("ik_camera_mount: linear solve failed.")
+
+            dq5 = np.asarray(dq5, dtype=float).reshape(5)
+            step_norm = float(np.linalg.norm(dq5))
+            if max_joint_step_rad > 0 and step_norm > max_joint_step_rad:
+                dq5 *= max_joint_step_rad / step_norm
+
+            alpha = 1.0
+            accepted = False
+            r_norm = float(np.linalg.norm(r))
+            for _ls in range(22):
+                q_try = q.copy()
+                q_try[:5] = wrap_to_pi(q_try[:5] + alpha * dq5)
+                q_try[5] = q5_fixed
+                if not within_step(q_try):
+                    alpha *= 0.5
+                    continue
+                r_try = residual_vec(q_try, q5_fixed)
+                n_try = float(np.linalg.norm(r_try))
+                if n_try < r_norm * (1.0 - 1e-12):
+                    q = q_try
+                    best_q = q.copy()
+                    r = r_try
+                    accepted = True
+                    break
+                alpha *= 0.5
+
+            if not accepted:
+                g = J.T @ r
+                gn = float(np.linalg.norm(g))
+                if gn < 1e-18:
+                    return _fail("ik_camera_mount: line search stalled.")
+                dq_sd = -(max_joint_step_rad / gn) * g
+                q_sd = q.copy()
+                q_sd[:5] = wrap_to_pi(q_sd[:5] + dq_sd)
+                q_sd[5] = q5_fixed
+                if within_step(q_sd):
+                    r_sd = residual_vec(q_sd, q5_fixed)
+                    if float(np.linalg.norm(r_sd)) < r_norm:
+                        q = q_sd
+                        best_q = q.copy()
+                        r = r_sd
+                        continue
+                return _fail("ik_camera_mount: line search stalled.")
+
+        q = best_q
+        pos_e, rot_e = pose_errors(q, q5_fixed)
+        if position_only:
+            ok = pos_e <= pos_tol and within(q)
+        else:
+            ok = pos_e <= pos_tol and rot_e <= rot_tol and within(q)
+        if not ok:
+            if position_only:
+                return _fail(f"ik_camera_mount: position residual too large (pos={pos_e:.3e} m).")
+            return _fail(
+                f"ik_camera_mount: residual too large (pos={pos_e:.3e} m, rot={rot_e:.3e} rad)."
+            )
+
+        theta_mod = self.classical_to_dh_modified(q)
+        theta_all = theta_mod.reshape(1, 6)
+        info = {
+            "success": True,
+            "message": "ik_camera_mount: damped GN converged.",
+            "thetaAll": theta_all,
+            "qAll_classical": q.reshape(1, 6),
+            "pos_err_m": pos_e,
+            "rot_err_rad": rot_e,
+            "position_only": position_only,
+            "trans_weight": w_t,
+            "rot_weight": w_r,
+            "joint_limits_rad": self.joint_limits_rad,
+            "joint_limit_margin_rad": self.joint_limit_margin_rad,
+        }
+        return theta_mod, theta_all, info
 
     def validate_pipeline(self, n: int = 25, rng_seed: int = 0) -> dict:
         """FK -> IK -> FK round-trip sanity check, reporting mean/max errors."""
