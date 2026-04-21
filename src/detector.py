@@ -22,7 +22,7 @@ class ArucoDetector:
     marker_length = 0.02  # meters
 
     def find_tags(self, frame: np.ndarray) -> list[tuple[int, np.ndarray, np.ndarray]]:
-        """Detect ArUco tags in ``frame`` and return ``[(id, rvec, tvec), ...]``.
+        """Detect ArUco tags in ``frame``, draw marker borders and axes in-place, and return ``[(id, rvec, tvec), ...]``.
 
         Returns an empty list if no tags are detected.
         """
@@ -33,6 +33,9 @@ class ArucoDetector:
 
         if ids is None or len(ids) == 0:
             return []
+
+        # Draw marker borders
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
         object_points = np.array([
             [-self.marker_length / 2, +self.marker_length / 2, 0],
@@ -47,6 +50,20 @@ class ArucoDetector:
                 object_points, corners[i], self.camera_matrix, self.dist_coeffs
             )
             detections.append((ids[i][0].item(), rvec[:, 0], tvec[:, 0]))
+            # Draw axes for each detected marker
+            cv2.drawFrameAxes(
+                frame,
+                self.camera_matrix,
+                self.dist_coeffs,
+                rvec,
+                tvec,
+                self.marker_length * 0.5,  # axis length
+                2  # thickness
+            )
+
+            cv2.imshow("Detection Test", frame)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
         return detections
 
@@ -72,3 +89,6 @@ def detect(image_path: Annotated[Path, typer.Argument(help="Path to the image to
 
     console = Console()
     console.print(table)
+
+if __name__ == "__main__":
+    detect('/Users/clarewu/Downloads/me235/me235b/assets/1776720702.898416.png')
