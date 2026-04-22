@@ -85,6 +85,9 @@ PAD_COLORS: dict[PadTag, tuple[int, int, int]] = {
 # Thin pad slab in :meth:`HanoiTask.populate_scene` (must match :meth:`pad_center_from_marker_pose`).
 PAD_SLAB_THICKNESS_M: float = 0.004
 PAD_SLAB_CENTER_Z_M: float = -0.002
+# Local tag offsets in :meth:`HanoiTask.populate_scene` (pad / block parent frames).
+PAD_TAG_LOCAL_Z_M: float = 0.003
+BLOCK_TAG_Z_EPSILON_M: float = 0.001
 
 ALL_HANOI_TAGS: tuple[BoxTag | PadTag, ...] = tuple(BoxTag) + tuple(PadTag)
 
@@ -862,9 +865,6 @@ class HanoiTask:
             tag: fuse_rigid_transforms(samples) for tag, samples in pad_samples.items()
         }
 
-        for name, T in self._scan_plot_transforms(box_detections, pad_detections):
-            self.renderer.add_scan_pose_estimate(name, T)
-
         ingest = False
         if self.camera is not None:
             ingest = True
@@ -901,26 +901,71 @@ class HanoiTask:
                 "(check Viser scene / intrinsics)."
             )
 
+        for name, T in self._scan_plot_transforms(
+            box_detections,
+            pad_detections,
+            snap_translation_to_mesh=ingest,
+        ):
+            self.renderer.add_scan_pose_estimate(name, T)
+
         return box_detections, pad_detections
+
+    def _mesh_marker_center_world_pad(self, pad: PadTag) -> np.ndarray:
+        """World marker-center position matching :meth:`populate_scene` pad + tag."""
+        pc = self.pad_centers[pad]
+        ps = float(self.detector.pad_size)
+        tw = float(self.detector.marker_length)
+        d = (ps - tw) / 2
+        return np.array(
+            [
+                float(pc[0] - d),
+                float(pc[1] - d),
+                float(PAD_SLAB_CENTER_Z_M + PAD_TAG_LOCAL_Z_M),
+            ],
+            dtype=float,
+        )
+
+    def _mesh_marker_center_world_box(self, box: BoxTag) -> np.ndarray:
+        """World marker-center position matching :meth:`populate_scene` box + tag."""
+        c = self.block_centers[box]
+        w = float(BOX_WIDTHS[box])
+        tw = float(self.detector.marker_length)
+        bt = float(self.detector.block_thickness)
+        d = (w - tw) / 2
+        return np.array(
+            [
+                float(c[0] - d),
+                float(c[1] - d),
+                float(c[2] + bt / 2 + BLOCK_TAG_Z_EPSILON_M),
+            ],
+            dtype=float,
+        )
 
     def _scan_plot_transforms(
         self,
         box_detections: dict[BoxTag, np.ndarray],
         pad_detections: dict[PadTag, np.ndarray],
+        *,
+        snap_translation_to_mesh: bool,
     ) -> list[tuple[str, np.ndarray]]:
-        """World-frame **fused marker** poses for Viser scan triads.
+        """World-frame fused marker **rotation** with optional mesh-aligned **origin**.
 
-        Each frame is the full fused 4×4 from PnP + :func:`fuse_rigid_transforms`
-        (marker center on the pad / block). That matches the
-        geometry OpenCV reports, so triad origins sit on the actual markers and
-        offsets vs meshes are easy to read. Ingest still uses pad centers / stack z
-        in :meth:`_ingest_detections`.
+        After a full ingest, triad translations match :meth:`populate_scene` tag
+        placement (axis-aligned pad/box + local tag offsets) so Viser frames sit
+        on the same marker centers as the textured quads. Rotation still comes from
+        :func:`fuse_rigid_transforms` (PnP) so tilt/yaw error remains visible.
         """
         out: list[tuple[str, np.ndarray]] = []
         for tag, T_aruco in pad_detections.items():
-            out.append((f"fused_tag_pad_{int(tag)}", np.asarray(T_aruco, dtype=float).copy()))
+            Tp = np.asarray(T_aruco, dtype=float).copy()
+            if snap_translation_to_mesh and tag in self.pad_centers:
+                Tp[:3, 3] = self._mesh_marker_center_world_pad(tag)
+            out.append((f"fused_tag_pad_{int(tag)}", Tp))
         for box, T_aruco in box_detections.items():
-            out.append((f"fused_tag_box_{int(box)}", np.asarray(T_aruco, dtype=float).copy()))
+            Tp = np.asarray(T_aruco, dtype=float).copy()
+            if snap_translation_to_mesh and box in self.block_centers:
+                Tp[:3, 3] = self._mesh_marker_center_world_box(box)
+            out.append((f"fused_tag_box_{int(box)}", Tp))
         return out
 
     def _ingest_detections(
@@ -1114,7 +1159,7 @@ class HanoiTask:
             # flush with the pad's top face. In the pad's local frame, bottom-left
             # is -x, -y relative to the pad center.
             T_tag = np.eye(4, dtype=float)
-            T_tag[:3, 3] = [-(pad_size - tw) / 2, -(pad_size - tw) / 2, 0.003]
+            T_tag[:3, 3] = [-(pad_size - tw) / 2, -(pad_size - tw) / 2, PAD_TAG_LOCAL_Z_M]
             self.renderer.add_aruco_tag(int(pad), T_tag, tw, parent=handle)
 
         for box, center in self.block_centers.items():
@@ -1132,7 +1177,11 @@ class HanoiTask:
             # Block's ArUco tag is in the bottom-left corner of its top face.
             # Local frame of the block: origin at block center, +z up toward top face.
             T_tag = np.eye(4, dtype=float)
-            T_tag[:3, 3] = [-(width - tw) / 2, -(width - tw) / 2, bt / 2 + 0.001]
+            T_tag[:3, 3] = [
+                -(width - tw) / 2,
+                -(width - tw) / 2,
+                bt / 2 + BLOCK_TAG_Z_EPSILON_M,
+            ]
             self.renderer.add_aruco_tag(int(box), T_tag, tw, parent=handle)
 
     def randomize_sim_layout(self) -> None:
