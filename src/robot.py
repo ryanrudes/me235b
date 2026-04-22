@@ -167,7 +167,7 @@ class RobotController:
 
     def gripper_open(self) -> None:
         if self.is_live:
-            self.robot.gripper.open()
+            self.gripper.open()
         elif self.verbose:
             print("[robot] gripper_open (no-op; simulate/dry_run)")
         self.renderer.on_gripper("open")
@@ -180,7 +180,7 @@ class RobotController:
         of mashing them fully together. It's ignored for live hardware control.
         """
         if self.is_live:
-            self.robot.gripper.close()
+            self.gripper.close()
         elif self.verbose:
             print("[robot] gripper_close (no-op; simulate/dry_run)")
         self.renderer.on_gripper("closed", grasped_width_m=grasped_width_m)

@@ -32,7 +32,7 @@ from collections import defaultdict
 from enum import Enum, IntEnum
 import threading
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import typer
@@ -351,12 +351,55 @@ def _scan_detections_complete(
     return len(box_detections) == len(BoxTag) and len(pad_detections) == len(PadTag)
 
 
+def _serpentine_order_scan_points(
+    points: Sequence[np.ndarray] | np.ndarray,
+    *,
+    y_row_tol: float,
+) -> list[np.ndarray]:
+    """Order scan poses in alternating row direction (boustrophedon) in the table plane.
+
+    Points are grouped into rows by similar *y* (within ``y_row_tol``), ordered along
+    *x* left-to-right on even row indices and right-to-left on odd indices, so the
+    path does not reset to the far *x* after each row.
+    """
+    if isinstance(points, np.ndarray) and (points.size == 0 or points.shape[0] == 0):
+        return []
+    if not isinstance(points, np.ndarray) and not points:
+        return []
+    p = np.stack([np.asarray(x, dtype=float).reshape(3) for x in points], axis=0)
+    if p.shape[0] == 1:
+        return [p[0]]
+    ind = np.lexsort((p[:, 0], p[:, 1]))
+    p = p[ind]
+    rows: list[np.ndarray] = []
+    i = 0
+    n = p.shape[0]
+    while i < n:
+        y0 = p[i, 1]
+        j = i + 1
+        while j < n and abs(p[j, 1] - y0) <= y_row_tol:
+            j += 1
+        row = p[i:j]
+        row = row[row[:, 0].argsort()]
+        if len(rows) % 2 == 1:
+            row = row[::-1]
+        rows.append(row)
+        i = j
+    out = np.vstack(rows)
+    return [out[k] for k in range(out.shape[0])]
+
+
 def _create_point_grid(xmin: float, xmax: float, ymin: float, ymax: float, x_points: int, y_points: int, scan_height: float) -> np.ndarray:
     x_cell = (xmax - xmin) / x_points
     y_cell = (ymax - ymin) / y_points
-    x_grid, y_grid = np.meshgrid(np.arange(xmin, xmax + x_cell, x_cell), np.arange(ymin, ymax + y_cell, y_cell))
-    points = np.column_stack((x_grid.flatten(), y_grid.flatten(), np.full(x_grid.size, scan_height)))
-    return points
+    xs = np.arange(xmin, xmax + x_cell, x_cell)
+    ys = np.arange(ymin, ymax + y_cell, y_cell)
+    parts: list[np.ndarray] = []
+    for ri, y in enumerate(ys):
+        x_seq = xs if (ri % 2 == 0) else xs[::-1]
+        for x in x_seq:
+            parts.append(np.array([x, y, scan_height], dtype=float))
+    return np.stack(parts, axis=0) if parts else np.zeros((0, 3), dtype=float)
 
 
 def _default_scan_points(scan_height: float = DEFAULT_SCAN_HEIGHT) -> np.ndarray:
@@ -501,7 +544,7 @@ def compute_auto_scan_points(
     candidates: list[tuple[float, float]] = [(float(x), float(y)) for y in ys for x in xs]
 
     seed = _bootstrap_theta_for_scan_planning(kin, T_home)
-    # Deterministic sweep: outer y then x matches a natural scan path.
+    # Deterministic candidate ordering for IK seeding (serpentine applied to output later).
     candidates.sort(key=lambda xy: (xy[1], xy[0]))
 
     successes: list[tuple[np.ndarray, float, float, tuple[int, int]]] = []
@@ -527,8 +570,9 @@ def compute_auto_scan_points(
         if prev is None or rot_e < prev[1] or (rot_e == prev[1] and pos_e < prev[2]):
             best_by_cell[ck] = (xyz, rot_e, pos_e)
 
+    row_tol = max(float(step) * 0.51, 0.02)
     chosen: list[np.ndarray] = [t[0] for t in best_by_cell.values()]
-    chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+    chosen = _serpentine_order_scan_points(chosen, y_row_tol=row_tol)
     chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
 
     def _try_add_default() -> None:
@@ -552,7 +596,7 @@ def compute_auto_scan_points(
     if len(chosen) < 4:
         _try_add_default()
         chosen = [t[0] for t in best_by_cell.values()]
-        chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+        chosen = _serpentine_order_scan_points(chosen, y_row_tol=row_tol)
         chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
 
     if len(chosen) == 0:
@@ -565,7 +609,7 @@ def compute_auto_scan_points(
         xy = np.array([[float(p[0]), float(p[1])] for p in chosen], dtype=float)
         keep = _farthest_point_indices(xy, max_pts)
         chosen = [chosen[i] for i in keep]
-        chosen.sort(key=lambda p: (float(p[1]), float(p[0])))
+        chosen = _serpentine_order_scan_points(chosen, y_row_tol=row_tol)
         chosen = _chain_validate_scan_points(kin, T5c, chosen, T_home=T_home)
 
     out = np.stack(chosen, axis=0)

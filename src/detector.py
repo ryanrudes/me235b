@@ -40,6 +40,10 @@ class ArucoDetector:
             cv2.aruco.DICT_ARUCO_ORIGINAL
         )
         parameters = cv2.aruco.DetectorParameters()
+        # Subpixel corner refinement inside detectMarkers (see OpenCV ArUco tutorial:
+        # DetectorParameters::cornerRefinementMethod, cornerRefinementWinSize, …).
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # parameters.cornerRefinementWinSize = 5 # Optional adjustment
 
         # Tighten parameters to reduce false detections
         #parameters.minMarkerPerimeterRate = 0.0001  # Increase for higher strictness
@@ -72,6 +76,7 @@ class ArucoDetector:
             K = self.camera_matrix
         else:
             K = np.asarray(camera_matrix, dtype=float)
+
         if dist_coeffs is None:
             D = self.dist_coeffs
         else:
