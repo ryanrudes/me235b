@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyrobotiqr as rq
+import pyrobotiqur as rq
 import numpy as np
 
 from kinematics import UR10e
@@ -70,10 +70,11 @@ class RobotController:
         self.robot = urx.Robot(ip)
         if tcp is not None:
             self.robot.set_tcp(tuple(tcp))
-        self.gripper = rq.RobotiqGripper(tcp_host="192.168.0.2", port=54321)
+        time.sleep(0.2)
+        self.gripper = rq.RobotiqGripper("192.168.0.2", port=63352, timeout=20.0)
         self.gripper.connect()
         self.gripper.activate()
-        self.gripper.start()
+        self.gripper.open(speed=128, force=10)
 
     def close(self) -> None:
         if self.robot is not None:
@@ -172,7 +173,7 @@ class RobotController:
 
     def gripper_open(self) -> None:
         if self.is_live:
-            self.gripper.open()
+            self.gripper.open(speed=128, force=10)
         elif self.verbose:
             print("[robot] gripper_open (no-op; simulate/dry_run)")
         self.renderer.on_gripper("open")
@@ -185,7 +186,7 @@ class RobotController:
         of mashing them fully together. It's ignored for live hardware control.
         """
         if self.is_live:
-            self.gripper.close()
+            self.gripper.close(speed=128, force=10)
         elif self.verbose:
             print("[robot] gripper_close (no-op; simulate/dry_run)")
         self.renderer.on_gripper("closed", grasped_width_m=grasped_width_m)
