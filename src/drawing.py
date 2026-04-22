@@ -21,10 +21,10 @@ import numpy as np
 import typer
 from typing_extensions import Annotated
 
-from .kinematics import UR10e
-from .robot import RobotController
-from .sim import SimulationRenderer
-from .transforms import as_6vec, make_T, tool_orientation_tilted
+from kinematics import UR10e
+from robot import RobotController
+from sim import SimulationRenderer
+from transforms import as_6vec, make_T, tool_orientation_tilted
 
 
 Stroke = tuple[tuple[float, float], tuple[float, float]]

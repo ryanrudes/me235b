@@ -18,7 +18,7 @@ try:
 except ImportError:
     _scipy_least_squares = None
 
-from .transforms import as_6vec, inv_T, so3_log, wrap_to_pi
+from transforms import as_6vec, inv_T, so3_log, wrap_to_pi
 
 
 def dh_classical(a: float, alpha: float, d: float, theta: float) -> np.ndarray:

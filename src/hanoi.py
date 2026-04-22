@@ -38,10 +38,10 @@ import numpy as np
 import typer
 from typing_extensions import Annotated
 
-from .detector import ArucoDetector
-from .kinematics import UR10e
-from .robot import RobotController
-from .sim import (
+from detector import ArucoDetector
+from kinematics import UR10e
+from robot import RobotController
+from sim import (
     DemoAbort,
     LAB3_CAMERA_IMAGE_H,
     LAB3_CAMERA_IMAGE_W,
@@ -49,7 +49,7 @@ from .sim import (
     SimulationRenderer,
     ViserRenderer,
 )
-from .transforms import fuse_rigid_transforms, make_T, make_T_rpy
+from transforms import fuse_rigid_transforms, make_T, make_T_rpy
 
 
 class BoxTag(IntEnum):
@@ -1512,7 +1512,7 @@ def _build_renderer(
     *,
     viser_show_live_camera: bool = True,
     viser_sim_camera: ViserSimCamera = ViserSimCamera.lab,
-    viser_scan_gallery_width: int = 200,
+    viser_scan_gallery_width: int = 2304,
 ) -> SimulationRenderer | None:
     if mode is RenderMode.none:
         return None
@@ -1721,3 +1721,15 @@ def run_hanoi(
             renderer.close(
                 wait=(render is RenderMode.viser and not use_interactive),
             )
+
+
+# Run it for real
+run_hanoi(
+    ip="192.168.0.2",
+    simulate=False,
+    render=RenderMode.none,
+    tag_grasp_orientation=False,  # whether to use the measured tag orientation for the grasp pose
+    scan_settle_s=0.25,  # time to wait when taking picture at each scan point
+    tool_z_offset=0.20,  # distance from frame-6 to gripper center
+    approach_height=0.08,  # height to approach the grasp pose
+)

@@ -22,11 +22,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pyrobotiqr as rq
 import numpy as np
 
-from .kinematics import UR10e
-from .sim import NullRenderer, SimulationRenderer
-from .transforms import shortest_joint_motion_target, so3_log
+from kinematics import UR10e
+from sim import NullRenderer, SimulationRenderer
+from transforms import shortest_joint_motion_target, so3_log
 
 
 class RobotController:
@@ -69,6 +70,10 @@ class RobotController:
         self.robot = urx.Robot(ip)
         if tcp is not None:
             self.robot.set_tcp(tuple(tcp))
+        self.gripper = rq.RobotiqGripper(tcp_host="192.168.0.2", port=54321)
+        self.gripper.connect()
+        self.gripper.activate()
+        self.gripper.start()
 
     def close(self) -> None:
         if self.robot is not None:

@@ -33,8 +33,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from .kinematics import UR10e
-from .transforms import R_to_wxyz
+from kinematics import UR10e
+from transforms import R_to_wxyz
 
 
 class DemoAbort(Exception):

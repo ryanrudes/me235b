@@ -1,10 +1,10 @@
 import typer
 
-from .detector import detect
-from .drawing import run_draw
-from .grasp_from_tag import grasp_transform
-from .hanoi import run_hanoi
-from .urdf_visualizer import visualize_urdf
+from detector import detect
+from drawing import run_draw
+from grasp_from_tag import grasp_transform
+from hanoi import run_hanoi
+from urdf_visualizer import visualize_urdf
 
 app = typer.Typer()
 app.command("detect")(detect)

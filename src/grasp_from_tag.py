@@ -14,9 +14,9 @@ import numpy as np
 import typer
 from typing_extensions import Annotated
 
-from .detector import ArucoDetector
-from .hanoi import GRASP_ORIENTATION, T5C_DEFAULT
-from .kinematics import UR10e
+from detector import ArucoDetector
+from hanoi import GRASP_ORIENTATION, T5C_DEFAULT
+from kinematics import UR10e
 
 BLOCK_WIDTH = 0.08
 BLOCK_THICKNESS = 0.05
